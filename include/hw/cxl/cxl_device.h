@@ -465,7 +465,8 @@ typedef struct CXLDCD_Extent {
 	uint64_t len;
 	uint8_t tag[0x10];
 	uint16_t shared_seq;
-	uint8_t region_id;
+	uint8_t rsvd[0x6];
+	//uint8_t region_id;
     QTAILQ_ENTRY(CXLDCD_Extent) node;
 }CXLDCD_Extent;
 typedef QTAILQ_HEAD(, CXLDCD_Extent) CXLDCDExtentList;
