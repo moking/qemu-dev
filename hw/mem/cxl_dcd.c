@@ -1623,6 +1623,63 @@ void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
     }
 }
 
+void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog log,
+		uint8_t flags, uint8_t type, uint16_t hid, uint8_t region_id,
+		uint8_t *dc_extent, Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLEventMemoryModule module;
+	CXLEventDynamicCapacity dCap;
+    CXLEventRecordHdr *hdr = &module.hdr;
+    CXLDeviceState *cxlds;
+	CXLDynCapDev *dcd;
+    uint8_t enc_log;
+    int rc;
+
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_DCD)) {
+        error_setg(errp, "Path does not point to a CXL"
+			,"dynamic capacity device");
+        return;
+    }
+
+	dcd = CXL_DCD(obj);
+    cxlds = &dcd->cxl_dstate;
+	memset(&dCap, 0, sizeof(dCap));
+
+	/*
+	 * 8.2.9.1.5
+	 * All Dynamic Capacity event records shall set the Event Record
+	 * Severity field in the Common Event Record Format to Informational
+	 * Event. All Dynamic Capacity related events shall be logged in the
+	 * Dynamic Capacity Event Log. 
+	 */
+	assert(flags & (1<<CXL_EVENT_TYPE_INFO));
+    cxl_assign_event_header(hdr, &dynamic_capacity_uuid, flags, sizeof(dCap));
+
+	/*
+	 * 00h: add capacity
+	 * 01h: release capacity
+	 * 02h: forced capacity release
+	 * 03h: region configuration updated
+	 * 04h: Add capacity response
+	 * 05h: capacity released
+	 * */
+	dCap.type = type;
+	stw_le_p(&dCap.host_id, hid);
+	dCap.updated_region_id = region_id;
+	/* FIXME: do we have endian issue here? */
+	memcpy(&dCap.dynamic_capacity_extent, dc_extent, sizeof(CXLDCD_Extent));
+
+    if (cxl_event_insert(cxlds, CXL_EVENT_TYPE_DYNAMIC_CAP
+			, (CXLEventRecordRaw *)&module)) {
+        cxl_event_irq_assert_dcd(dcd);
+    }
+}
+
 static void ct3_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);

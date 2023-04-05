@@ -457,7 +457,6 @@ CXLRetCode cxl_event_clear_records(CXLDeviceState *cxlds,
                                    CXLClearEventPayload *pl);
 
 void cxl_event_irq_assert(CXLType3Dev *ct3d);
-
 void cxl_set_poison_list_overflowed(CXLType3Dev *ct3d);
 
 typedef struct CXLDCD_Extent {
@@ -483,6 +482,9 @@ struct CXLDCD_Region {
 #define DCD_MAX_REGION_NUM 8
 
 struct CXLDynCapDev {
+    /* Private */
+    PCIDevice parent_obj;
+
 	uint8_t num_hosts; //Table 7-55
 	uint8_t num_regions; // 1-8
 	uint8_t sanitize_mask; // sanitize on release configuration support mask
@@ -500,4 +502,6 @@ struct CXLDynCapDev {
 /* FIXME: Fan */
 #define TYPE_CXL_DCD "cxl-dcd"
 OBJECT_DECLARE_TYPE(CXLDynCapDev, CXLType3Class, CXL_DCD)
+
+void cxl_event_irq_assert_dcd(CXLDynCapDev *dcd);
 #endif

@@ -264,3 +264,23 @@
             'type': 'CxlCorErrorType'
   }
 }
+
+##
+# @cxl-process-dynamic-capacity-event:
+#
+# Command to process dynamic capacity device event, including add/clear
+#
+# @path: CXL DCD canonical QOM path
+# @type: Type of error.
+#
+# Since: 8.0
+##
+{ 'command': 'cxl-process-dynamic-capacity-event',
+  'data': { 'path': 'str',
+            'log': 'CxlEventLog',
+			'flags':'uint8',
+			'type':'uint8',
+			'hid': 'uint16', 'rid':'uint8',
+			'extent': 'str'
+  }
+}
