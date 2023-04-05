@@ -1158,8 +1158,7 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
 			assert(ent);
 			ent->start_dpa = dpa;
 			ent->len = len;
-			ent->region_id = find_region_id(dcd, dpa);
-			assert(ent->region_id < dcd->num_regions);
+			assert(find_region_id(dcd, dpa) < dcd->num_regions);
 			/* FIXME: Fan
 			 * How to set tag and shared_seq;
 			 * */
