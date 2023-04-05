@@ -12,10 +12,12 @@
 #include "qemu/pmem.h"
 #include "qemu/range.h"
 #include "qemu/rcu.h"
+#include "qemu/guest-random.h"
 #include "sysemu/hostmem.h"
 #include "sysemu/numa.h"
 #include "hw/cxl/cxl.h"
 #include "hw/pci/msix.h"
+#include "hw/pci/spdm.h"
 
 #define DWORD_BYTE 4
 
@@ -31,7 +33,8 @@ enum {
 };
 
 static int ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
-                                         int dsmad_handle, MemoryRegion *mr)
+                                         int dsmad_handle, MemoryRegion *mr,
+                                         bool is_pmem, uint64_t dpa_base)
 {
     g_autofree CDATDsmas *dsmas = NULL;
     g_autofree CDATDslbis *dslbis0 = NULL;
@@ -50,8 +53,8 @@ static int ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
             .length = sizeof(*dsmas),
         },
         .DSMADhandle = dsmad_handle,
-        .flags = CDAT_DSMAS_FLAG_NV,
-        .DPA_base = 0,
+        .flags = is_pmem ? CDAT_DSMAS_FLAG_NV : 0,
+        .DPA_base = dpa_base,
         .DPA_length = int128_get64(mr->size),
     };
 
@@ -130,8 +133,11 @@ static int ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
             .length = sizeof(*dsemts),
         },
         .DSMAS_handle = dsmad_handle,
-        /* Reserved - the non volatile from DSMAS matters */
-        .EFI_memory_type_attr = 2,
+        /*
+         * NV: Reserved - the non volatile from DSMAS matters
+         * V: EFI_MEMORY_SP
+         */
+        .EFI_memory_type_attr = is_pmem ? 2 : 1,
         .DPA_offset = 0,
         .DPA_length = int128_get64(mr->size),
     };
@@ -150,33 +156,66 @@ static int ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
 static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 {
     g_autofree CDATSubHeader **table = NULL;
-    MemoryRegion *nonvolatile_mr;
     CXLType3Dev *ct3d = priv;
+    MemoryRegion *volatile_mr = NULL, *nonvolatile_mr = NULL;
     int dsmad_handle = 0;
-    int rc;
+    int cur_ent = 0;
+    int len = 0;
+    int rc, i;
 
-    if (!ct3d->hostmem) {
+    if (!ct3d->hostpmem && !ct3d->hostvmem) {
         return 0;
     }
 
-    nonvolatile_mr = host_memory_backend_get_memory(ct3d->hostmem);
-    if (!nonvolatile_mr) {
-        return -EINVAL;
+    if (ct3d->hostvmem) {
+        volatile_mr = host_memory_backend_get_memory(ct3d->hostvmem);
+        if (!volatile_mr) {
+            return -EINVAL;
+        }
+        len += CT3_CDAT_NUM_ENTRIES;
     }
 
-    table = g_malloc0(CT3_CDAT_NUM_ENTRIES * sizeof(*table));
+    if (ct3d->hostpmem) {
+        nonvolatile_mr = host_memory_backend_get_memory(ct3d->hostpmem);
+        if (!nonvolatile_mr) {
+            return -EINVAL;
+        }
+        len += CT3_CDAT_NUM_ENTRIES;
+    }
+
+    table = g_malloc0(len * sizeof(*table));
     if (!table) {
         return -ENOMEM;
     }
 
-    rc = ct3_build_cdat_entries_for_mr(table, dsmad_handle++, nonvolatile_mr);
-    if (rc < 0) {
-        return rc;
+    /* Now fill them in */
+    if (volatile_mr) {
+        rc = ct3_build_cdat_entries_for_mr(table, dsmad_handle++, volatile_mr,
+                                           false, 0);
+        if (rc < 0) {
+            return rc;
+        }
+        cur_ent = CT3_CDAT_NUM_ENTRIES;
     }
+
+    if (nonvolatile_mr) {
+        rc = ct3_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
+                nonvolatile_mr, true, (volatile_mr ? volatile_mr->size : 0));
+        if (rc < 0) {
+            goto error_cleanup;
+        }
+        cur_ent += CT3_CDAT_NUM_ENTRIES;
+    }
+    assert(len == cur_ent);
 
     *cdat_table = g_steal_pointer(&table);
 
-    return CT3_CDAT_NUM_ENTRIES;
+    return len;
+error_cleanup:
+    for (i = 0; i < cur_ent; i++) {
+        g_free(table[i]);
+    }
+    return rc;
 }
 
 static void ct3_free_cdat_table(CDATSubHeader **cdat_table, int num, void *priv)
@@ -232,12 +271,119 @@ static bool cxl_doe_cdat_rsp(DOECap *doe_cap)
     return true;
 }
 
+static bool cxl_doe_compliance_rsp(DOECap *doe_cap)
+{
+    CXLCompRsp *rsp = &CXL_TYPE3(doe_cap->pdev)->cxl_cstate.compliance.response;
+    CXLCompReqHeader *req = pcie_doe_get_write_mbox_ptr(doe_cap);
+    uint32_t req_len = 0, rsp_len = 0;
+    CXLCompType type = req->req_code;
+
+    switch (type) {
+    case CXL_COMP_MODE_CAP:
+        req_len = sizeof(CXLCompCapReq);
+        rsp_len = sizeof(CXLCompCapRsp);
+        rsp->cap_rsp.status = 0x0;
+        rsp->cap_rsp.available_cap_bitmask = 0;
+        rsp->cap_rsp.enabled_cap_bitmask = 0;
+        break;
+    case CXL_COMP_MODE_STATUS:
+        req_len = sizeof(CXLCompStatusReq);
+        rsp_len = sizeof(CXLCompStatusRsp);
+        rsp->status_rsp.cap_bitfield = 0;
+        rsp->status_rsp.cache_size = 0;
+        rsp->status_rsp.cache_size_units = 0;
+        break;
+    case CXL_COMP_MODE_HALT:
+        req_len = sizeof(CXLCompHaltReq);
+        rsp_len = sizeof(CXLCompHaltRsp);
+        break;
+    case CXL_COMP_MODE_MULT_WR_STREAM:
+        req_len = sizeof(CXLCompMultiWriteStreamingReq);
+        rsp_len = sizeof(CXLCompMultiWriteStreamingRsp);
+        break;
+    case CXL_COMP_MODE_PRO_CON:
+        req_len = sizeof(CXLCompProducerConsumerReq);
+        rsp_len = sizeof(CXLCompProducerConsumerRsp);
+        break;
+    case CXL_COMP_MODE_BOGUS:
+        req_len = sizeof(CXLCompBogusWritesReq);
+        rsp_len = sizeof(CXLCompBogusWritesRsp);
+        break;
+    case CXL_COMP_MODE_INJ_POISON:
+        req_len = sizeof(CXLCompInjectPoisonReq);
+        rsp_len = sizeof(CXLCompInjectPoisonRsp);
+        break;
+    case CXL_COMP_MODE_INJ_CRC:
+        req_len = sizeof(CXLCompInjectCrcReq);
+        rsp_len = sizeof(CXLCompInjectCrcRsp);
+        break;
+    case CXL_COMP_MODE_INJ_FC:
+        req_len = sizeof(CXLCompInjectFlowCtrlReq);
+        rsp_len = sizeof(CXLCompInjectFlowCtrlRsp);
+        break;
+    case CXL_COMP_MODE_TOGGLE_CACHE:
+        req_len = sizeof(CXLCompToggleCacheFlushReq);
+        rsp_len = sizeof(CXLCompToggleCacheFlushRsp);
+        break;
+    case CXL_COMP_MODE_INJ_MAC:
+        req_len = sizeof(CXLCompInjectMacDelayReq);
+        rsp_len = sizeof(CXLCompInjectMacDelayRsp);
+        break;
+    case CXL_COMP_MODE_INS_UNEXP_MAC:
+        req_len = sizeof(CXLCompInsertUnexpMacReq);
+        rsp_len = sizeof(CXLCompInsertUnexpMacRsp);
+        break;
+    case CXL_COMP_MODE_INJ_VIRAL:
+        req_len = sizeof(CXLCompInjectViralReq);
+        rsp_len = sizeof(CXLCompInjectViralRsp);
+        break;
+    case CXL_COMP_MODE_INJ_ALMP:
+        req_len = sizeof(CXLCompInjectAlmpReq);
+        rsp_len = sizeof(CXLCompInjectAlmpRsp);
+        break;
+    case CXL_COMP_MODE_IGN_ALMP:
+        req_len = sizeof(CXLCompIgnoreAlmpReq);
+        rsp_len = sizeof(CXLCompIgnoreAlmpRsp);
+        break;
+    case CXL_COMP_MODE_INJ_BIT_ERR:
+        req_len = sizeof(CXLCompInjectBitErrInFlitReq);
+        rsp_len = sizeof(CXLCompInjectBitErrInFlitRsp);
+        break;
+    default:
+        break;
+    }
+
+    /* Discard if request length mismatched */
+    if (pcie_doe_get_obj_len(req) < DIV_ROUND_UP(req_len, DWORD_BYTE)) {
+        return false;
+    }
+
+    /* Common fields for each compliance type */
+    rsp->header.doe_header.vendor_id = CXL_VENDOR_ID;
+    rsp->header.doe_header.data_obj_type = CXL_DOE_COMPLIANCE;
+    rsp->header.doe_header.length = DIV_ROUND_UP(rsp_len, DWORD_BYTE);
+    rsp->header.rsp_code = type;
+    rsp->header.version = 0x1;
+    rsp->header.length = rsp_len;
+
+    memcpy(doe_cap->read_mbox, rsp, rsp_len);
+
+    doe_cap->read_mbox_len += rsp->header.doe_header.length;
+
+    return true;
+}
+
 static uint32_t ct3d_config_read(PCIDevice *pci_dev, uint32_t addr, int size)
 {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
     uint32_t val;
 
     if (pcie_doe_read_config(&ct3d->doe_cdat, addr, size, &val)) {
+        return val;
+    } else if (pcie_doe_read_config(&ct3d->doe_comp, addr, size, &val)) {
+        return val;
+    } else if (ct3d->spdm_port &&
+               pcie_doe_read_config(&ct3d->doe_spdm, addr, size, &val)) {
         return val;
     }
 
@@ -249,7 +395,11 @@ static void ct3d_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
 {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
 
+    if (ct3d->spdm_port) {
+        pcie_doe_write_config(&ct3d->doe_spdm, addr, val, size);
+    }
     pcie_doe_write_config(&ct3d->doe_cdat, addr, val, size);
+    pcie_doe_write_config(&ct3d->doe_comp, addr, val, size);
     pci_default_write_config(pci_dev, addr, val, size);
     pcie_aer_write_config(pci_dev, addr, val, size);
 }
@@ -263,33 +413,66 @@ static void ct3d_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
 static void build_dvsecs(CXLType3Dev *ct3d)
 {
     CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
+    CXLDVSECRegisterLocator *regloc_dvsec;
     uint8_t *dvsec;
+    int i;
+    uint32_t range1_size_hi = 0, range1_size_lo = 0,
+             range1_base_hi = 0, range1_base_lo = 0,
+             range2_size_hi = 0, range2_size_lo = 0,
+             range2_base_hi = 0, range2_base_lo = 0;
+
+    /*
+     * Volatile memory is mapped as (0x0)
+     * Persistent memory is mapped at (volatile->size)
+     */
+    if (ct3d->hostvmem) {
+        range1_size_hi = ct3d->hostvmem->size >> 32;
+        range1_size_lo = (2 << 5) | (2 << 2) | 0x3 |
+                         (ct3d->hostvmem->size & 0xF0000000);
+        if (ct3d->hostpmem) {
+            range2_size_hi = ct3d->hostpmem->size >> 32;
+            range2_size_lo = (2 << 5) | (2 << 2) | 0x3 |
+                             (ct3d->hostpmem->size & 0xF0000000);
+        }
+    } else {
+        range1_size_hi = ct3d->hostpmem->size >> 32;
+        range1_size_lo = (2 << 5) | (2 << 2) | 0x3 |
+                         (ct3d->hostpmem->size & 0xF0000000);
+    }
 
     dvsec = (uint8_t *)&(CXLDVSECDevice){
         .cap = 0x1e,
         .ctrl = 0x2,
         .status2 = 0x2,
-        .range1_size_hi = ct3d->hostmem->size >> 32,
-        .range1_size_lo = (2 << 5) | (2 << 2) | 0x3 |
-        (ct3d->hostmem->size & 0xF0000000),
-        .range1_base_hi = 0,
-        .range1_base_lo = 0,
+        .range1_size_hi = range1_size_hi,
+        .range1_size_lo = range1_size_lo,
+        .range1_base_hi = range1_base_hi,
+        .range1_base_lo = range1_base_lo,
+        .range2_size_hi = range2_size_hi,
+        .range2_size_lo = range2_size_lo,
+        .range2_base_hi = range2_base_hi,
+        .range2_base_lo = range2_base_lo,
     };
     cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
                                PCIE_CXL_DEVICE_DVSEC_LENGTH,
                                PCIE_CXL_DEVICE_DVSEC,
                                PCIE_CXL2_DEVICE_DVSEC_REVID, dvsec);
 
-    dvsec = (uint8_t *)&(CXLDVSECRegisterLocator){
+    regloc_dvsec = &(CXLDVSECRegisterLocator){
         .rsvd         = 0,
-        .reg0_base_lo = RBI_COMPONENT_REG | CXL_COMPONENT_REG_BAR_IDX,
-        .reg0_base_hi = 0,
-        .reg1_base_lo = RBI_CXL_DEVICE_REG | CXL_DEVICE_REG_BAR_IDX,
-        .reg1_base_hi = 0,
+        .reg_base[0].lo = RBI_COMPONENT_REG | CXL_COMPONENT_REG_BAR_IDX,
+        .reg_base[0].hi = 0,
+        .reg_base[1].lo = RBI_CXL_DEVICE_REG | CXL_DEVICE_REG_BAR_IDX,
+        .reg_base[1].hi = 0,
     };
+    for (i = 0; i < CXL_NUM_CPMU_INSTANCES; i++) {
+        regloc_dvsec->reg_base[2 + i].lo = CXL_CPMU_OFFSET(i) |
+            RBI_CXL_CPMU_REG | CXL_DEVICE_REG_BAR_IDX;
+        regloc_dvsec->reg_base[2 + i].hi = 0;
+    }
     cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
                                REG_LOC_DVSEC_LENGTH, REG_LOC_DVSEC,
-                               REG_LOC_DVSEC_REVID, dvsec);
+                               REG_LOC_DVSEC_REVID, (uint8_t *)regloc_dvsec);
     dvsec = (uint8_t *)&(CXLDVSECDeviceGPF){
         .phase2_duration = 0x603, /* 3 seconds */
         .phase2_power = 0x33, /* 0x33 miliwatts */
@@ -314,14 +497,14 @@ static void hdm_decoder_commit(CXLType3Dev *ct3d, int which)
 {
     ComponentRegisters *cregs = &ct3d->cxl_cstate.crb;
     uint32_t *cache_mem = cregs->cache_mem_registers;
-
-    assert(which == 0);
+    uint32_t ctrl = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + which * 0x20 / 4);
 
     /* TODO: Sanity checks that the decoder is possible */
-    ARRAY_FIELD_DP32(cache_mem, CXL_HDM_DECODER0_CTRL, COMMIT, 0);
-    ARRAY_FIELD_DP32(cache_mem, CXL_HDM_DECODER0_CTRL, ERR, 0);
+    ctrl = FIELD_DP32(ctrl, CXL_HDM_DECODER0_CTRL, COMMIT, 0);
+    ctrl = FIELD_DP32(ctrl, CXL_HDM_DECODER0_CTRL, ERR, 0);
+    ctrl = FIELD_DP32(ctrl, CXL_HDM_DECODER0_CTRL, COMMITTED, 1);
 
-    ARRAY_FIELD_DP32(cache_mem, CXL_HDM_DECODER0_CTRL, COMMITTED, 1);
+    stl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + which * 0x20 / 4, ctrl);
 }
 
 static int ct3d_qmp_uncor_err_to_cxl(CxlUncorErrorType qmp_err)
@@ -399,8 +582,20 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
 
     switch (offset) {
     case A_CXL_HDM_DECODER0_CTRL:
-        should_commit = FIELD_EX32(value, CXL_HDM_DECODER0_CTRL, COMMIT);
         which_hdm = 0;
+        should_commit = FIELD_EX32(value, CXL_HDM_DECODER0_CTRL, COMMIT);
+        break;
+    case A_CXL_HDM_DECODER1_CTRL:
+        which_hdm = 1;
+        should_commit = FIELD_EX32(value, CXL_HDM_DECODER0_CTRL, COMMIT);
+        break;
+    case A_CXL_HDM_DECODER2_CTRL:
+        which_hdm = 2;
+        should_commit = FIELD_EX32(value, CXL_HDM_DECODER0_CTRL, COMMIT);
+        break;
+    case A_CXL_HDM_DECODER3_CTRL:
+        which_hdm = 3;
+        should_commit = FIELD_EX32(value, CXL_HDM_DECODER0_CTRL, COMMIT);
         break;
     case A_CXL_RAS_UNC_ERR_STATUS:
     {
@@ -492,36 +687,69 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
 static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
 {
     DeviceState *ds = DEVICE(ct3d);
-    MemoryRegion *mr;
-    char *name;
 
-    if (!ct3d->hostmem) {
-        error_setg(errp, "memdev property must be set");
+    if (!ct3d->hostmem && !ct3d->hostvmem && !ct3d->hostpmem) {
+        error_setg(errp, "at least one memdev property must be set");
+        return false;
+    } else if (ct3d->hostmem && ct3d->hostpmem) {
+        error_setg(errp, "[memdev] cannot be used with new "
+                         "[persistent-memdev] property");
+        return false;
+    } else if (ct3d->hostmem) {
+        /* Use of hostmem property implies pmem */
+        ct3d->hostpmem = ct3d->hostmem;
+        ct3d->hostmem = NULL;
+    }
+
+    if (ct3d->hostpmem && !ct3d->lsa) {
+        error_setg(errp, "lsa property must be set for persistent devices");
         return false;
     }
 
-    mr = host_memory_backend_get_memory(ct3d->hostmem);
-    if (!mr) {
-        error_setg(errp, "memdev property must be set");
-        return false;
+    if (ct3d->hostvmem) {
+        MemoryRegion *vmr;
+        char *v_name;
+
+        vmr = host_memory_backend_get_memory(ct3d->hostvmem);
+        if (!vmr) {
+            error_setg(errp, "volatile memdev must have backing device");
+            return false;
+        }
+        memory_region_set_nonvolatile(vmr, false);
+        memory_region_set_enabled(vmr, true);
+        host_memory_backend_set_mapped(ct3d->hostvmem, true);
+        if (ds->id) {
+            v_name = g_strdup_printf("cxl-type3-dpa-vmem-space:%s", ds->id);
+        } else {
+            v_name = g_strdup("cxl-type3-dpa-vmem-space");
+        }
+        address_space_init(&ct3d->hostvmem_as, vmr, v_name);
+        ct3d->cxl_dstate.vmem_size = vmr->size;
+        ct3d->cxl_dstate.mem_size += vmr->size;
+        g_free(v_name);
     }
-    memory_region_set_nonvolatile(mr, true);
-    memory_region_set_enabled(mr, true);
-    host_memory_backend_set_mapped(ct3d->hostmem, true);
 
-    if (ds->id) {
-        name = g_strdup_printf("cxl-type3-dpa-space:%s", ds->id);
-    } else {
-        name = g_strdup("cxl-type3-dpa-space");
-    }
-    address_space_init(&ct3d->hostmem_as, mr, name);
-    g_free(name);
+    if (ct3d->hostpmem) {
+        MemoryRegion *pmr;
+        char *p_name;
 
-    ct3d->cxl_dstate.pmem_size = ct3d->hostmem->size;
-
-    if (!ct3d->lsa) {
-        error_setg(errp, "lsa property must be set");
-        return false;
+        pmr = host_memory_backend_get_memory(ct3d->hostpmem);
+        if (!pmr) {
+            error_setg(errp, "persistent memdev must have backing device");
+            return false;
+        }
+        memory_region_set_nonvolatile(pmr, true);
+        memory_region_set_enabled(pmr, true);
+        host_memory_backend_set_mapped(ct3d->hostpmem, true);
+        if (ds->id) {
+            p_name = g_strdup_printf("cxl-type3-dpa-pmem-space:%s", ds->id);
+        } else {
+            p_name = g_strdup("cxl-type3-dpa-pmem-space");
+        }
+        address_space_init(&ct3d->hostpmem_as, pmr, p_name);
+        ct3d->cxl_dstate.pmem_size = pmr->size;
+        ct3d->cxl_dstate.mem_size += pmr->size;
+        g_free(p_name);
     }
 
     return true;
@@ -532,6 +760,17 @@ static DOEProtocol doe_cdat_prot[] = {
     { }
 };
 
+static DOEProtocol doe_comp_prot[] = {
+    {CXL_VENDOR_ID, CXL_DOE_COMPLIANCE, cxl_doe_compliance_rsp},
+    { }
+};
+
+static DOEProtocol doe_spdm_prot[] = {
+    { PCI_VENDOR_ID_PCI_SIG, PCI_SIG_DOE_CMA, pcie_doe_spdm_rsp },
+    { PCI_VENDOR_ID_PCI_SIG, PCI_SIG_DOE_SECURED_CMA, pcie_doe_spdm_rsp },
+    { }
+};
+
 static void ct3_realize(PCIDevice *pci_dev, Error **errp)
 {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
@@ -539,7 +778,7 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     ComponentRegisters *regs = &cxl_cstate->crb;
     MemoryRegion *mr = &regs->component_registers;
     uint8_t *pci_conf = pci_dev->config;
-    unsigned short msix_num = 1;
+    unsigned short msix_num = 10;
     int i, rc;
 
     QTAILQ_INIT(&ct3d->error_list);
@@ -572,6 +811,8 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, mr);
 
     cxl_device_register_block_init(OBJECT(pci_dev), &ct3d->cxl_dstate);
+    cxl_cpmu_register_block_init(OBJECT(pci_dev), &ct3d->cxl_dstate, 0, 6);
+    cxl_cpmu_register_block_init(OBJECT(pci_dev), &ct3d->cxl_dstate, 1, 7);
     pci_register_bar(pci_dev, CXL_DEVICE_REG_BAR_IDX,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
                          PCI_BASE_ADDRESS_MEM_TYPE_64,
@@ -600,14 +841,29 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     if (rc) {
         goto err_release_cdat;
     }
+    cxl_event_init(&ct3d->cxl_dstate, 2);
 
+    pcie_doe_init(pci_dev, &ct3d->doe_comp, 0x1b0, doe_comp_prot, true, 8);
+    if (ct3d->spdm_port) {
+        pcie_doe_init(pci_dev, &ct3d->doe_spdm, 0x1d0, doe_spdm_prot, true, 9);
+        ct3d->doe_spdm.socket = spdm_sock_init(ct3d->spdm_port, errp);
+        if (ct3d->doe_spdm.socket < 0) {
+            goto err_free_special_ops;
+        }
+    }
     return;
 
 err_release_cdat:
     cxl_doe_cdat_release(cxl_cstate);
+err_free_special_ops:
     g_free(regs->special_ops);
 err_address_space_free:
-    address_space_destroy(&ct3d->hostmem_as);
+    if (ct3d->hostpmem) {
+        address_space_destroy(&ct3d->hostpmem_as);
+    }
+    if (ct3d->hostvmem) {
+        address_space_destroy(&ct3d->hostvmem_as);
+    }
     return;
 }
 
@@ -619,87 +875,143 @@ static void ct3_exit(PCIDevice *pci_dev)
 
     pcie_aer_exit(pci_dev);
     cxl_doe_cdat_release(cxl_cstate);
+    spdm_sock_fini(ct3d->doe_spdm.socket);
     g_free(regs->special_ops);
-    address_space_destroy(&ct3d->hostmem_as);
+    if (ct3d->hostpmem) {
+        address_space_destroy(&ct3d->hostpmem_as);
+    }
+    if (ct3d->hostvmem) {
+        address_space_destroy(&ct3d->hostvmem_as);
+    }
 }
 
-/* TODO: Support multiple HDM decoders and DPA skip */
 static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
 {
     uint32_t *cache_mem = ct3d->cxl_cstate.crb.cache_mem_registers;
-    uint64_t decoder_base, decoder_size, hpa_offset;
-    uint32_t hdm0_ctrl;
-    int ig, iw;
+    uint32_t cap;
+    uint64_t dpa_base = 0;
+    int i;
 
-    decoder_base = (((uint64_t)cache_mem[R_CXL_HDM_DECODER0_BASE_HI] << 32) |
-                    cache_mem[R_CXL_HDM_DECODER0_BASE_LO]);
-    if ((uint64_t)host_addr < decoder_base) {
-        return false;
+    cap = ldl_le_p(cache_mem + R_CXL_HDM_DECODER_CAPABILITY);
+    for (i = 0; i < cxl_decoder_count_dec(FIELD_EX32(cap, CXL_HDM_DECODER_CAPABILITY,
+                                                     DECODER_COUNT));
+         i++) {
+        uint64_t decoder_base, decoder_size, hpa_offset, skip;
+        uint32_t hdm_ctrl, low, high;
+        int ig, iw;
+
+        low = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_BASE_LO + i * 0x20 / 4);
+        high = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_BASE_HI + i * 0x20 / 4);
+        decoder_base = ((uint64_t)high << 32) | (low & 0xf0000000);
+
+        low = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_SIZE_LO + i * 0x20 / 4);
+        high = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_SIZE_HI + i * 0x20 / 4);
+        decoder_size = ((uint64_t)high << 32) | (low & 0xf0000000);
+
+        low = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_DPA_SKIP_LO + i * 0x20 / 4);
+        high = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_DPA_SKIP_HI + i * 0x20 / 4);
+        skip = ((uint64_t)high << 32) | (low & 0xf0000000);
+        dpa_base += skip;
+
+        hpa_offset = (uint64_t)host_addr - decoder_base;
+
+        hdm_ctrl = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + i * 0x20 / 4);
+        iw = FIELD_EX32(hdm_ctrl, CXL_HDM_DECODER0_CTRL, IW);
+        ig = FIELD_EX32(hdm_ctrl, CXL_HDM_DECODER0_CTRL, IG);
+        if (!FIELD_EX32(hdm_ctrl, CXL_HDM_DECODER0_CTRL, COMMITTED)) {
+            return false;
+        }
+        if (((uint64_t)host_addr < decoder_base) || (hpa_offset >= decoder_size)) {
+            dpa_base += decoder_size / cxl_interleave_ways_dec(iw, &error_fatal);
+            continue;
+        }
+
+        *dpa = dpa_base +
+            ((MAKE_64BIT_MASK(0, 8 + ig) & hpa_offset) |
+             ((MAKE_64BIT_MASK(8 + ig + iw, 64 - 8 - ig - iw) & hpa_offset) >> iw));
+
+        return true;
+    }
+    return false;
+}
+
+static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
+                                       hwaddr host_addr,
+                                       unsigned int size,
+                                       AddressSpace **as,
+                                       uint64_t *dpa_offset)
+{
+    MemoryRegion *vmr = NULL, *pmr = NULL;
+
+    if (ct3d->hostvmem) {
+        vmr = host_memory_backend_get_memory(ct3d->hostvmem);
+    }
+    if (ct3d->hostpmem) {
+        pmr = host_memory_backend_get_memory(ct3d->hostpmem);
     }
 
-    hpa_offset = (uint64_t)host_addr - decoder_base;
-
-    decoder_size = ((uint64_t)cache_mem[R_CXL_HDM_DECODER0_SIZE_HI] << 32) |
-        cache_mem[R_CXL_HDM_DECODER0_SIZE_LO];
-    if (hpa_offset >= decoder_size) {
-        return false;
+    if (!vmr && !pmr) {
+        return -ENODEV;
     }
 
-    hdm0_ctrl = cache_mem[R_CXL_HDM_DECODER0_CTRL];
-    iw = FIELD_EX32(hdm0_ctrl, CXL_HDM_DECODER0_CTRL, IW);
-    ig = FIELD_EX32(hdm0_ctrl, CXL_HDM_DECODER0_CTRL, IG);
+    if (!cxl_type3_dpa(ct3d, host_addr, dpa_offset)) {
+        return -EINVAL;
+    }
 
-    *dpa = (MAKE_64BIT_MASK(0, 8 + ig) & hpa_offset) |
-        ((MAKE_64BIT_MASK(8 + ig + iw, 64 - 8 - ig - iw) & hpa_offset) >> iw);
+    if (*dpa_offset > int128_get64(ct3d->cxl_dstate.mem_size)) {
+        return -EINVAL;
+    }
 
-    return true;
+    if (vmr) {
+        if (*dpa_offset < int128_get64(vmr->size)) {
+            *as = &ct3d->hostvmem_as;
+        } else {
+            *as = &ct3d->hostpmem_as;
+            *dpa_offset -= vmr->size;
+        }
+    } else {
+        *as = &ct3d->hostpmem_as;
+    }
+
+    return 0;
 }
 
 MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
                            unsigned size, MemTxAttrs attrs)
 {
-    CXLType3Dev *ct3d = CXL_TYPE3(d);
-    uint64_t dpa_offset;
-    MemoryRegion *mr;
+    uint64_t dpa_offset = 0;
+    AddressSpace *as = NULL;
+    int res;
 
-    /* TODO support volatile region */
-    mr = host_memory_backend_get_memory(ct3d->hostmem);
-    if (!mr) {
+    res = cxl_type3_hpa_to_as_and_dpa(CXL_TYPE3(d), host_addr, size,
+                                      &as, &dpa_offset);
+    if (res) {
         return MEMTX_ERROR;
     }
 
-    if (!cxl_type3_dpa(ct3d, host_addr, &dpa_offset)) {
-        return MEMTX_ERROR;
+    if (sanitize_running(&CXL_TYPE3(d)->cxl_dstate)) {
+        qemu_guest_getrandom_nofail(data, size);
+        return MEMTX_OK;
     }
-
-    if (dpa_offset > int128_get64(mr->size)) {
-        return MEMTX_ERROR;
-    }
-
-    return address_space_read(&ct3d->hostmem_as, dpa_offset, attrs, data, size);
+    return address_space_read(as, dpa_offset, attrs, data, size);
 }
 
 MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
                             unsigned size, MemTxAttrs attrs)
 {
-    CXLType3Dev *ct3d = CXL_TYPE3(d);
-    uint64_t dpa_offset;
-    MemoryRegion *mr;
+    uint64_t dpa_offset = 0;
+    AddressSpace *as = NULL;
+    int res;
 
-    mr = host_memory_backend_get_memory(ct3d->hostmem);
-    if (!mr) {
+    res = cxl_type3_hpa_to_as_and_dpa(CXL_TYPE3(d), host_addr, size,
+                                      &as, &dpa_offset);
+    if (res) {
+        return MEMTX_ERROR;
+    }
+    if (sanitize_running(&CXL_TYPE3(d)->cxl_dstate)) {
         return MEMTX_OK;
     }
-
-    if (!cxl_type3_dpa(ct3d, host_addr, &dpa_offset)) {
-        return MEMTX_OK;
-    }
-
-    if (dpa_offset > int128_get64(mr->size)) {
-        return MEMTX_OK;
-    }
-    return address_space_write(&ct3d->hostmem_as, dpa_offset, attrs,
-                               &data, size);
+    return address_space_write(as, dpa_offset, attrs, &data, size);
 }
 
 static void ct3d_reset(DeviceState *dev)
@@ -714,17 +1026,26 @@ static void ct3d_reset(DeviceState *dev)
 
 static Property ct3_props[] = {
     DEFINE_PROP_LINK("memdev", CXLType3Dev, hostmem, TYPE_MEMORY_BACKEND,
-                     HostMemoryBackend *),
+                     HostMemoryBackend *), /* for backward compatibility */
+    DEFINE_PROP_LINK("persistent-memdev", CXLType3Dev, hostpmem,
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("volatile-memdev", CXLType3Dev, hostvmem,
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_LINK("lsa", CXLType3Dev, lsa, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
     DEFINE_PROP_UINT64("sn", CXLType3Dev, sn, UI64_NULL),
     DEFINE_PROP_STRING("cdat", CXLType3Dev, cxl_cstate.cdat.filename),
+    DEFINE_PROP_UINT16("spdm", CXLType3Dev, spdm_port, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 
 static uint64_t get_lsa_size(CXLType3Dev *ct3d)
 {
     MemoryRegion *mr;
+
+    if (!ct3d->lsa) {
+        return 0;
+    }
 
     mr = host_memory_backend_get_memory(ct3d->lsa);
     return memory_region_size(mr);
@@ -743,6 +1064,10 @@ static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size,
     MemoryRegion *mr;
     void *lsa;
 
+    if (!ct3d->lsa) {
+        return 0;
+    }
+
     mr = host_memory_backend_get_memory(ct3d->lsa);
     validate_lsa_access(mr, size, offset);
 
@@ -758,6 +1083,10 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
     MemoryRegion *mr;
     void *lsa;
 
+    if (!ct3d->lsa) {
+        return;
+    }
+
     mr = host_memory_backend_get_memory(ct3d->lsa);
     validate_lsa_access(mr, size, offset);
 
@@ -769,6 +1098,97 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
      * Just like the PMEM, if the guest is not allowed to exit gracefully, label
      * updates will get lost.
      */
+}
+
+static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
+{
+    MemoryRegion *vmr = NULL, *pmr = NULL;
+    AddressSpace *as;
+
+    if (ct3d->hostvmem) {
+        vmr = host_memory_backend_get_memory(ct3d->hostvmem);
+    }
+    if (ct3d->hostpmem) {
+        pmr = host_memory_backend_get_memory(ct3d->hostpmem);
+    }
+
+    if (!vmr && !pmr) {
+        return false;
+    }
+
+    if (dpa_offset + 64 > int128_get64(ct3d->cxl_dstate.mem_size)) {
+        return false;
+    }
+
+    if (vmr) {
+        if (dpa_offset <= int128_get64(vmr->size)) {
+            as = &ct3d->hostvmem_as;
+        } else {
+            as = &ct3d->hostpmem_as;
+            dpa_offset -= vmr->size;
+        }
+    } else {
+        as = &ct3d->hostpmem_as;
+    }
+
+    address_space_write(as, dpa_offset, MEMTXATTRS_UNSPECIFIED, &data, 64);
+    return true;
+}
+
+void cxl_set_poison_list_overflowed(CXLType3Dev *ct3d)
+{
+        ct3d->poison_list_overflowed = true;
+        ct3d->poison_list_overflow_ts =
+            cxl_device_get_timestamp(&ct3d->cxl_dstate);
+}
+
+void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length,
+                           Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLType3Dev *ct3d;
+    CXLPoison *p;
+
+    if (length % 64) {
+        error_setg(errp, "Poison injection must be in multiples of 64 bytes");
+        return;
+    }
+    if (start % 64) {
+        error_setg(errp, "Poison start address must be 64 byte aligned");
+        return;
+    }
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path does not point to a CXL type 3 device");
+        return;
+    }
+
+    ct3d = CXL_TYPE3(obj);
+
+    QLIST_FOREACH(p, &ct3d->poison_list, node) {
+        if (((start >= p->start) && (start < p->start + p->length)) ||
+            ((start + length > p->start) &&
+             (start + length <= p->start + p->length))) {
+            error_setg(errp, "Overlap with existing poisoned region not supported");
+            return;
+        }
+    }
+
+    if (ct3d->poison_list_cnt == CXL_POISON_LIST_LIMIT) {
+        cxl_set_poison_list_overflowed(ct3d);
+        return;
+    }
+
+    p = g_new0(CXLPoison, 1);
+    p->length = length;
+    p->start = start;
+    p->type = CXL_POISON_TYPE_INTERNAL; /* Different from injected via the mbox */
+
+    QLIST_INSERT_HEAD(&ct3d->poison_list, p, node);
+    ct3d->poison_list_cnt++;
 }
 
 /* For uncorrectable errors include support for multiple header recording */
@@ -912,6 +1332,297 @@ void qmp_cxl_inject_correctable_error(const char *path, CxlCorErrorType type,
     pcie_aer_inject_error(PCI_DEVICE(obj), &err);
 }
 
+static void cxl_assign_event_header(CXLEventRecordHdr *hdr,
+                                    const QemuUUID *uuid, uint8_t flags,
+                                    uint8_t length)
+{
+    hdr->flags[0] = flags;
+    hdr->length = length;
+    memcpy(&hdr->id, uuid, sizeof(hdr->id));
+    hdr->timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static const QemuUUID gen_media_uuid = {
+    .data = UUID(0xfbcd0a77, 0xc260, 0x417f,
+                 0x85, 0xa9, 0x08, 0x8b, 0x16, 0x21, 0xeb, 0xa6),
+};
+
+static const QemuUUID dram_uuid = {
+    .data = UUID(0x601dcbb3, 0x9c06, 0x4eab, 0xb8, 0xaf,
+                 0x4e, 0x9b, 0xfb, 0x5c, 0x96, 0x24),
+};
+
+static const QemuUUID memory_module_uuid = {
+    .data = UUID(0xfe927475, 0xdd59, 0x4339, 0xa5, 0x86,
+                 0x79, 0xba, 0xb1, 0x13, 0xb7, 0x74),
+};
+
+static const QemuUUID dynamic_capacity_uuid = {
+    .data = UUID(0xca95afa7, 0xf183, 0x4018, 0x8c, 0x2f,
+                 0x95, 0x26, 0x8e, 0x10, 0x1a, 0x2a),
+};
+
+#define CXL_GMER_VALID_CHANNEL                          BIT(0)
+#define CXL_GMER_VALID_RANK                             BIT(1)
+#define CXL_GMER_VALID_DEVICE                           BIT(2)
+#define CXL_GMER_VALID_COMPONENT                        BIT(3)
+
+static int ct3d_qmp_cxl_event_log_enc(CxlEventLog log)
+{
+    switch (log) {
+    case CXL_EVENT_LOG_INFORMATIONAL:
+        return CXL_EVENT_TYPE_INFO;
+    case CXL_EVENT_LOG_WARNING:
+        return CXL_EVENT_TYPE_WARN;
+    case CXL_EVENT_LOG_FAILURE:
+        return CXL_EVENT_TYPE_FAIL;
+    case CXL_EVENT_LOG_FATAL:
+        return CXL_EVENT_TYPE_FATAL;
+/* DCD not yet supported */
+    default:
+        return -EINVAL;
+    }
+}
+/* Component ID is device specific.  Define this as a string. */
+void qmp_cxl_inject_gen_media_event(const char *path, CxlEventLog log,
+                                    uint8_t flags, uint64_t physaddr,
+                                    uint8_t descriptor, uint8_t type,
+                                    uint8_t transaction_type,
+                                    bool has_channel, uint8_t channel,
+                                    bool has_rank, uint8_t rank,
+                                    bool has_device, uint32_t device,
+                                    const char *component_id,
+                                    Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLEventGenMedia gem;
+    CXLEventRecordHdr *hdr = &gem.hdr;
+    CXLDeviceState *cxlds;
+    CXLType3Dev *ct3d;
+    uint16_t valid_flags = 0;
+    uint8_t enc_log;
+    int rc;
+
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path does not point to a CXL type 3 device");
+        return;
+    }
+    ct3d = CXL_TYPE3(obj);
+    cxlds = &ct3d->cxl_dstate;
+
+    rc = ct3d_qmp_cxl_event_log_enc(log);
+    if (rc < 0) {
+        error_setg(errp, "Unhandled error log type");
+        return;
+    }
+    enc_log = rc;
+
+    memset(&gem, 0, sizeof(gem));
+    cxl_assign_event_header(hdr, &gen_media_uuid, flags, sizeof(gem));
+
+    gem.phys_addr = physaddr;
+    gem.descriptor = descriptor;
+    gem.type = type;
+    gem.transaction_type = transaction_type;
+
+    if (has_channel) {
+        gem.channel = channel;
+        valid_flags |= CXL_GMER_VALID_CHANNEL;
+    }
+
+    if (has_rank) {
+        gem.rank = rank;
+        valid_flags |= CXL_GMER_VALID_RANK;
+    }
+
+    if (has_device) {
+        st24_le_p(gem.device, device);
+        valid_flags |= CXL_GMER_VALID_DEVICE;
+    }
+
+    if (component_id) {
+        strncpy((char *)gem.component_id, component_id,
+                sizeof(gem.component_id) - 1);
+        valid_flags |= CXL_GMER_VALID_COMPONENT;
+    }
+
+    stw_le_p(&gem.validity_flags, valid_flags);
+
+    if (cxl_event_insert(cxlds, enc_log, (CXLEventRecordRaw *)&gem)) {
+        cxl_event_irq_assert(ct3d);
+    }
+}
+
+#define CXL_DRAM_VALID_CHANNEL                          BIT(0)
+#define CXL_DRAM_VALID_RANK                             BIT(1)
+#define CXL_DRAM_VALID_NIBBLE_MASK                      BIT(2)
+#define CXL_DRAM_VALID_BANK_GROUP                       BIT(3)
+#define CXL_DRAM_VALID_BANK                             BIT(4)
+#define CXL_DRAM_VALID_ROW                              BIT(5)
+#define CXL_DRAM_VALID_COLUMN                           BIT(6)
+#define CXL_DRAM_VALID_CORRECTION_MASK                  BIT(7)
+
+void qmp_cxl_inject_dram_event(const char *path, CxlEventLog log, uint8_t flags,
+                               uint64_t physaddr, uint8_t descriptor,
+                               uint8_t type, uint8_t transaction_type,
+                               bool has_channel, uint8_t channel,
+                               bool has_rank, uint8_t rank,
+                               bool has_nibble_mask, uint32_t nibble_mask,
+                               bool has_bank_group, uint8_t bank_group,
+                               bool has_bank, uint8_t bank,
+                               bool has_row, uint32_t row,
+                               bool has_column, uint16_t column,
+                               bool has_correction_mask, uint64List *correction_mask,
+                               Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLEventDram dram;
+    CXLEventRecordHdr *hdr = &dram.hdr;
+    CXLDeviceState *cxlds;
+    CXLType3Dev *ct3d;
+    uint16_t valid_flags = 0;
+    uint8_t enc_log;
+    int rc;
+
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path does not point to a CXL type 3 device");
+        return;
+    }
+    ct3d = CXL_TYPE3(obj);
+    cxlds = &ct3d->cxl_dstate;
+
+    rc = ct3d_qmp_cxl_event_log_enc(log);
+    if (rc < 0) {
+        error_setg(errp, "Unhandled error log type");
+        return;
+    }
+    enc_log = rc;
+
+    memset(&dram, 0, sizeof(dram));
+    cxl_assign_event_header(hdr, &dram_uuid, flags, sizeof(dram));
+    dram.phys_addr = physaddr;
+    dram.descriptor = descriptor;
+    dram.type = type;
+    dram.transaction_type = transaction_type;
+
+    if (has_channel) {
+        dram.channel = channel;
+        valid_flags |= CXL_DRAM_VALID_CHANNEL;
+    }
+
+    if (has_rank) {
+        dram.rank = rank;
+        valid_flags |= CXL_DRAM_VALID_RANK;
+    }
+
+    if (has_nibble_mask) {
+        st24_le_p(dram.nibble_mask, nibble_mask);
+        valid_flags |= CXL_DRAM_VALID_NIBBLE_MASK;
+    }
+
+    if (has_bank_group) {
+        dram.bank_group = bank_group;
+        valid_flags |= CXL_DRAM_VALID_BANK_GROUP;
+    }
+
+    if (has_bank) {
+        dram.bank = bank;
+        valid_flags |= CXL_DRAM_VALID_BANK;
+    }
+
+    if (has_row) {
+        st24_le_p(dram.row, row);
+        valid_flags |= CXL_DRAM_VALID_ROW;
+    }
+
+    if (has_column) {
+        stw_le_p(&dram.column, column);
+        valid_flags |= CXL_DRAM_VALID_COLUMN;
+    }
+
+    if (has_correction_mask) {
+        int count = 0;
+        while (correction_mask && count < 4) {
+            stq_le_p(&dram.correction_mask[count],
+                     correction_mask->value);
+            count++;
+            correction_mask = correction_mask->next;
+        }
+        valid_flags |= CXL_DRAM_VALID_CORRECTION_MASK;
+    }
+
+    stw_le_p(&dram.validity_flags, valid_flags);
+
+    if (cxl_event_insert(cxlds, enc_log, (CXLEventRecordRaw *)&dram)) {
+        cxl_event_irq_assert(ct3d);
+    }
+    return;
+}
+
+void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
+                                        uint8_t flags, uint8_t type,
+                                        uint8_t health_status,
+                                        uint8_t media_status,
+                                        uint8_t additional_status,
+                                        uint8_t life_used,
+                                        int16_t temperature,
+                                        uint32_t dirty_shutdown_count,
+                                        uint32_t corrected_volatile_error_count,
+                                        uint32_t corrected_persistent_error_count,
+                                        Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLEventMemoryModule module;
+    CXLEventRecordHdr *hdr = &module.hdr;
+    CXLDeviceState *cxlds;
+    CXLType3Dev *ct3d;
+    uint8_t enc_log;
+    int rc;
+
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path does not point to a CXL type 3 device");
+        return;
+    }
+    ct3d = CXL_TYPE3(obj);
+    cxlds = &ct3d->cxl_dstate;
+
+    rc = ct3d_qmp_cxl_event_log_enc(log);
+    if (rc < 0) {
+        error_setg(errp, "Unhandled error log type");
+        return;
+    }
+    enc_log = rc;
+
+    memset(&module, 0, sizeof(module));
+    cxl_assign_event_header(hdr, &memory_module_uuid, flags, sizeof(module));
+
+    module.type = type;
+    module.health_status = health_status;
+    module.media_status = media_status;
+    module.additional_status = additional_status;
+    module.life_used = life_used;
+    stw_le_p(&module.temperature, temperature);
+    stl_le_p(&module.dirty_shutdown_count, dirty_shutdown_count);
+    stl_le_p(&module.corrected_volatile_error_count, corrected_volatile_error_count);
+    stl_le_p(&module.corrected_persistent_error_count, corrected_persistent_error_count);
+
+    if (cxl_event_insert(cxlds, enc_log, (CXLEventRecordRaw *)&module)) {
+        cxl_event_irq_assert(ct3d);
+    }
+}
+
 static void ct3_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -929,13 +1640,14 @@ static void ct3_class_init(ObjectClass *oc, void *data)
     pc->config_read = ct3d_config_read;
 
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
-    dc->desc = "CXL PMEM Device (Type 3)";
+    dc->desc = "CXL Memory Device (Type 3)";
     dc->reset = ct3d_reset;
     device_class_set_props(dc, ct3_props);
 
     cvc->get_lsa_size = get_lsa_size;
     cvc->get_lsa = get_lsa;
     cvc->set_lsa = set_lsa;
+    cvc->set_cacheline = set_cacheline;
 }
 
 static const TypeInfo ct3d_info = {
