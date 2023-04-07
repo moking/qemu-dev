@@ -971,7 +971,8 @@ static CXLRetCode cmd_dcd_get_dyn_cap_config(struct cxl_cmd *cmd,
 
     struct get_dyn_cap_config_in_pl *in = (void *)cmd->payload;
     struct get_dyn_cap_config_out_pl *out = (void *)cmd->payload;
-    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
+    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     uint16_t record_count = 0, i = 0;
     uint16_t out_pl_len;
 
@@ -1032,7 +1033,8 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
 
     struct get_dyn_cap_ext_list_in_pl *in = (void *)cmd->payload;
     struct get_dyn_cap_ext_list_out_pl *out = (void *)cmd->payload;
-    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
+    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     uint16_t record_count = 0, i = 0, record_done=0;
 	CXLDCDExtentList *extent_list = &dcd->extents;
 	CXLDCD_Extent *ent;
@@ -1119,7 +1121,8 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
     } QEMU_PACKED;
 
     struct get_dyn_cap_ext_list_in_pl *in = (void *)cmd->payload;
-    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
+    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     CXLDCDExtentList *extent_list = &dcd->extents;
     CXLDCD_Extent *ent;
 	uint32_t i;
@@ -1185,7 +1188,8 @@ static CXLRetCode cmd_dcd_release_dcd_capacity(struct cxl_cmd *cmd,
     } QEMU_PACKED;
 
     struct release_dcd_cap_in_pl *in = (void *)cmd->payload;
-    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
+    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     CXLDCDExtentList *extent_list = &dcd->extents;
     CXLDCD_Extent *ent;
 	uint32_t i;
