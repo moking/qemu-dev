@@ -472,7 +472,7 @@ typedef QTAILQ_HEAD(, CXLDCD_Extent) CXLDCDExtentList;
 
 struct CXLDCD_Region {
 	uint64_t base;
-	uint64_t decode_len; /*256MB aligned*/
+	uint64_t decode_len; /* in multiples of 256MB */
 	uint64_t len;
 	uint64_t block_size;
 	uint32_t dsmadhandle;
@@ -483,7 +483,7 @@ struct CXLDCD_Region {
 
 struct CXLDynCapDev {
     /* Private */
-    PCIDevice parent_obj;
+	CXLType3Dev dev;
 
 	uint8_t num_hosts; //Table 7-55
 	uint8_t num_regions; // 1-8
@@ -496,12 +496,27 @@ struct CXLDynCapDev {
 	uint32_t ext_list_gen_seq;
 	uint64_t total_dynamic_capicity; // 256M aligned
 	CXLDCDExtentList extents;
-    CXLDeviceState cxl_dstate;
 };
 
 /* FIXME: Fan */
 #define TYPE_CXL_DCD "cxl-dcd"
-OBJECT_DECLARE_TYPE(CXLDynCapDev, CXLType3Class, CXL_DCD)
+OBJECT_DECLARE_TYPE(CXLDynCapDev, CXLDcdClass, CXL_DCD)
+
+struct CXLDcdClass {
+    /* Private */
+    PCIDeviceClass parent_class;
+
+    /* public */
+    uint64_t (*get_lsa_size)(CXLDynCapDev *dcd);
+
+    uint64_t (*get_lsa)(CXLDynCapDev *dcd, void *buf, uint64_t size,
+                        uint64_t offset);
+    void (*set_lsa)(CXLDynCapDev *dcd, const void *buf, uint64_t size,
+                    uint64_t offset);
+    bool (*set_cacheline)(CXLDynCapDev *dcd, uint64_t dpa_offset, uint8_t *data);
+};
+
+
 
 void cxl_event_irq_assert_dcd(CXLDynCapDev *dcd);
 #endif

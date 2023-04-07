@@ -249,8 +249,8 @@ void cxl_event_irq_assert(CXLType3Dev *ct3d)
 
 void cxl_event_irq_assert_dcd(CXLDynCapDev *dcd)
 {
-    CXLDeviceState *cxlds = &dcd->cxl_dstate;
-    PCIDevice *pdev = &dcd->parent_obj;
+    CXLDeviceState *cxlds = &dcd->dev.cxl_dstate;
+    PCIDevice *pdev = &dcd->dev.parent_obj;
     int i;
 
     for (i = 0; i < CXL_EVENT_TYPE_MAX; i++) {
