@@ -33,8 +33,8 @@ enum {
 };
 
 static int cxl_dcd_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
-                                         int dsmad_handle, MemoryRegion *mr,
-                                         bool is_pmem, uint64_t dpa_base)
+                                         int dsmad_handle,  uint8_t flags,
+										 uint64_t dpa_base, uint64_t size)
 {
     g_autofree CDATDsmas *dsmas = NULL;
     g_autofree CDATDslbis *dslbis0 = NULL;
@@ -53,9 +53,9 @@ static int cxl_dcd_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
             .length = sizeof(*dsmas),
         },
         .DSMADhandle = dsmad_handle,
-        .flags = is_pmem ? CDAT_DSMAS_FLAG_NV : 0,
+        .flags = flags,
         .DPA_base = dpa_base,
-        .DPA_length = int128_get64(mr->size),
+        .DPA_length = size,
     };
 
     /* For now, no memory side cache, plausiblish numbers */
@@ -139,7 +139,7 @@ static int cxl_dcd_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
          */
         .EFI_memory_type_attr = is_pmem ? 2 : 1,
         .DPA_offset = 0,
-        .DPA_length = int128_get64(mr->size),
+        .DPA_length = size,
     };
 
     /* Header always at start of structure */
@@ -159,6 +159,7 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 	CXLDynCapDev *dcd = priv;
     CXLType3Dev *ct3d = &dcd->dev;
     MemoryRegion *volatile_mr = NULL, *nonvolatile_mr = NULL;
+	MemoryRegion *dc_mr = NULL;
     int dsmad_handle = 0;
     int cur_ent = 0;
     int len = 0;
@@ -184,6 +185,17 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
         len += CT3_CDAT_NUM_ENTRIES;
     }
 
+	if (dcd->host_dc) {
+		dc_mr = host_memory_backend_get_memory(dc->host_dc);
+        if (!dc_mr) {
+            return -EINVAL;
+        }
+		len += CT3_CDAT_NUM_ENTRIES * dcd->num_regions;
+	} else {
+		/* Do we allow dcd has not dc region ??? */
+		;
+	}
+
     table = g_malloc0(len * sizeof(*table));
     if (!table) {
         return -ENOMEM;
@@ -191,8 +203,8 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 
     /* Now fill them in */
     if (volatile_mr) {
-        rc = cxl_dcd_build_cdat_entries_for_mr(table, dsmad_handle++, volatile_mr,
-                                           false, 0);
+        rc = cxl_dcd_build_cdat_entries_for_mr(table, dsmad_handle++,
+				0, 0, int128_get64(mr->size));
         if (rc < 0) {
             return rc;
         }
@@ -201,12 +213,32 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 
     if (nonvolatile_mr) {
         rc = cxl_dcd_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
-                nonvolatile_mr, true, (volatile_mr ? volatile_mr->size : 0));
+                CDAT_DSMAS_FLAG_NV, (volatile_mr ? volatile_mr->size : 0), int128_get64(mr->size));
         if (rc < 0) {
             goto error_cleanup;
         }
         cur_ent += CT3_CDAT_NUM_ENTRIES;
     }
+
+    if (dc_mr) {
+		uint64_t region_base = volatile_mr ? volatile_mr->size+nonvolatile_mr->size: nonvolatile_mr->size;
+
+		/*
+		 * Currently we create cdat entries for each region, should we only create dsmas table instead??
+		 * We assume all dc regions are non-volatile for now.
+		 *
+		 */
+		for (i=0; i<dcd->num_regions; i++) {
+			rc = cxl_dcd_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
+				CDAT_DSMAS_FLAG_NV|CDAT_DSMAS_FLAG_DYNAMIC_CAP, region_base, dcd->regions[i].len);
+			if (rc < 0) {
+				goto error_cleanup;
+			}
+			cur_ent += CT3_CDAT_NUM_ENTRIES;
+			region_base += dcd->regions[i].len;
+		}
+    }
+
     assert(len == cur_ent);
 
     *cdat_table = g_steal_pointer(&table);
@@ -413,6 +445,7 @@ static void cxl_dcd_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val
  */
 #define UI64_NULL ~(0ULL)
 
+/* FIXME: no dynamic region related setting done yet if needed */
 static void build_dvsecs(CXLDynCapDev *dcd)
 {
 	CXLType3Dev *ct3d = &dcd->dev;
@@ -632,8 +665,9 @@ static void cxl_dcd_reg_write(void *opaque, hwaddr offset, uint64_t value,
     }
 }
 
-static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
+static bool cxl_setup_memory(CXLDynCapDev *dcd, Error **errp)
 {
+	CXLType3Dev *ct3d = &dcd->dev;
     DeviceState *ds = DEVICE(ct3d);
 
     if (!ct3d->hostmem && !ct3d->hostvmem && !ct3d->hostpmem) {
@@ -667,9 +701,9 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         memory_region_set_enabled(vmr, true);
         host_memory_backend_set_mapped(ct3d->hostvmem, true);
         if (ds->id) {
-            v_name = g_strdup_printf("cxl-type3-dpa-vmem-space:%s", ds->id);
+            v_name = g_strdup_printf("cxl-dcd-dpa-vmem-space:%s", ds->id);
         } else {
-            v_name = g_strdup("cxl-type3-dpa-vmem-space");
+            v_name = g_strdup("cxl-dcd-dpa-vmem-space");
         }
         address_space_init(&ct3d->hostvmem_as, vmr, v_name);
         ct3d->cxl_dstate.vmem_size = vmr->size;
@@ -690,14 +724,45 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         memory_region_set_enabled(pmr, true);
         host_memory_backend_set_mapped(ct3d->hostpmem, true);
         if (ds->id) {
-            p_name = g_strdup_printf("cxl-type3-dpa-pmem-space:%s", ds->id);
+            p_name = g_strdup_printf("cxl-dcd-dpa-pmem-space:%s", ds->id);
         } else {
-            p_name = g_strdup("cxl-type3-dpa-pmem-space");
+            p_name = g_strdup("cxl-dcd-dpa-pmem-space");
         }
         address_space_init(&ct3d->hostpmem_as, pmr, p_name);
         ct3d->cxl_dstate.pmem_size = pmr->size;
         ct3d->cxl_dstate.mem_size += pmr->size;
         g_free(p_name);
+    }
+
+    if (dcd->host_dc) {
+        MemoryRegion *dc_mr;
+        char *dc_name;
+		uint64_t total_region_size = 0;
+		int i;
+
+        dc_mr = host_memory_backend_get_memory(ct3d->host_dc);
+        if (!dc_mr) {
+            error_setg(errp, "dynamic capacity must have backing device");
+            return false;
+        }
+        memory_region_set_nonvolatile(dc_mr, true);
+        memory_region_set_enabled(dc_mr, true);
+        host_memory_backend_set_mapped(dcd->dc_mr, true);
+        if (ds->id) {
+            dc_name = g_strdup_printf("cxl-dcd-dpa-dc-space:%s", ds->id);
+        } else {
+            dc_name = g_strdup("cxl-dcd-dpa-dc-space");
+        }
+        address_space_init(&ct3d->host_dc_as, dc_mr, dc_name);
+
+		for (i=0; i<dcd->num_regions; i++) {
+			total_region_size ++ dcd->regions[i].len;
+		}
+		assert(total_region_size <= dc_mr->size);
+		assert(dc_mr->size %(256*1024*1024) == 0);
+
+        dcd->total_dynamic_capicity = dc_mr->size;
+        g_free(dc_name);
     }
 
     return true;
@@ -737,7 +802,7 @@ static void cxl_dcd_realize(PCIDevice *pci_dev, Error **errp)
 
     QTAILQ_INIT(&ct3d->error_list);
 
-    if (!cxl_setup_memory(&dcd->dev, errp)) {
+    if (!cxl_setup_memory(dcd, errp)) {
         return;
     }
 
@@ -988,6 +1053,8 @@ static Property cxl_dcd_props[] = {
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_LINK("lsa", CXLDynCapDev, dev.lsa, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
+    DEFINE_PROP_LINK("dcmemdev", CXLDynCapDev, dev.host_dc,
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_UINT64("sn", CXLDynCapDev, dev.sn, UI64_NULL),
     DEFINE_PROP_STRING("cdat", CXLDynCapDev, dev.cxl_cstate.cdat.filename),
     DEFINE_PROP_UINT16("spdm", CXLDynCapDev, dev.spdm_port, 0),

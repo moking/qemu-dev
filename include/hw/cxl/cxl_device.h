@@ -484,6 +484,8 @@ struct CXLDCD_Region {
 struct CXLDynCapDev {
     /* Private */
 	CXLType3Dev dev;
+    HostMemoryBackend *host_dc;
+    AddressSpace host_dc_as;
 
 	uint8_t num_hosts; //Table 7-55
 	uint8_t num_regions; // 1-8
