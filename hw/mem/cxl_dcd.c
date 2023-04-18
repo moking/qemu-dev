@@ -137,7 +137,7 @@ static int cxl_dcd_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
          * NV: Reserved - the non volatile from DSMAS matters
          * V: EFI_MEMORY_SP
          */
-        .EFI_memory_type_attr = is_pmem ? 2 : 1,
+        .EFI_memory_type_attr = flags ? 2 : 1,
         .DPA_offset = 0,
         .DPA_length = size,
     };
@@ -186,7 +186,7 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     }
 
 	if (dcd->host_dc) {
-		dc_mr = host_memory_backend_get_memory(dc->host_dc);
+		dc_mr = host_memory_backend_get_memory(dcd->host_dc);
         if (!dc_mr) {
             return -EINVAL;
         }
@@ -204,7 +204,7 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     /* Now fill them in */
     if (volatile_mr) {
         rc = cxl_dcd_build_cdat_entries_for_mr(table, dsmad_handle++,
-				0, 0, int128_get64(mr->size));
+				0, 0, int128_get64(volatile_mr->size));
         if (rc < 0) {
             return rc;
         }
@@ -213,7 +213,7 @@ static int cxl_dcd_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 
     if (nonvolatile_mr) {
         rc = cxl_dcd_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
-                CDAT_DSMAS_FLAG_NV, (volatile_mr ? volatile_mr->size : 0), int128_get64(mr->size));
+                CDAT_DSMAS_FLAG_NV, (volatile_mr ? volatile_mr->size : 0), int128_get64(nonvolatile_mr->size));
         if (rc < 0) {
             goto error_cleanup;
         }
@@ -427,7 +427,7 @@ static uint32_t cxl_dcd_config_read(PCIDevice *pci_dev, uint32_t addr, int size)
 static void cxl_dcd_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
                               int size)
 {
-    CXLType3Dev *dcd = CXL_DCD(pci_dev);
+    CXLDynCapDev *dcd = CXL_DCD(pci_dev);
     CXLType3Dev *ct3d = &dcd->dev;
 
     if (ct3d->spdm_port) {
@@ -554,6 +554,7 @@ static void cxl_dcd_reg_write(void *opaque, hwaddr offset, uint64_t value,
     CXLComponentState *cxl_cstate = opaque;
     ComponentRegisters *cregs = &cxl_cstate->crb;
     CXLType3Dev *ct3d = container_of(cxl_cstate, CXLType3Dev, cxl_cstate);
+	CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     uint32_t *cache_mem = cregs->cache_mem_registers;
     bool should_commit = false;
     int which_hdm = -1;
@@ -661,7 +662,7 @@ static void cxl_dcd_reg_write(void *opaque, hwaddr offset, uint64_t value,
 
     stl_le_p((uint8_t *)cache_mem + offset, value);
     if (should_commit) {
-        hdm_decoder_commit(ct3d, which_hdm);
+        hdm_decoder_commit(dcd, which_hdm);
     }
 }
 
@@ -740,23 +741,23 @@ static bool cxl_setup_memory(CXLDynCapDev *dcd, Error **errp)
 		uint64_t total_region_size = 0;
 		int i;
 
-        dc_mr = host_memory_backend_get_memory(ct3d->host_dc);
+        dc_mr = host_memory_backend_get_memory(dcd->host_dc);
         if (!dc_mr) {
             error_setg(errp, "dynamic capacity must have backing device");
             return false;
         }
         memory_region_set_nonvolatile(dc_mr, true);
         memory_region_set_enabled(dc_mr, true);
-        host_memory_backend_set_mapped(dcd->dc_mr, true);
+        host_memory_backend_set_mapped(dcd->host_dc, true);
         if (ds->id) {
             dc_name = g_strdup_printf("cxl-dcd-dpa-dc-space:%s", ds->id);
         } else {
             dc_name = g_strdup("cxl-dcd-dpa-dc-space");
         }
-        address_space_init(&ct3d->host_dc_as, dc_mr, dc_name);
+        address_space_init(&dcd->host_dc_as, dc_mr, dc_name);
 
 		for (i=0; i<dcd->num_regions; i++) {
-			total_region_size ++ dcd->regions[i].len;
+			total_region_size += dcd->regions[i].len;
 		}
 		assert(total_region_size <= dc_mr->size);
 		assert(dc_mr->size %(256*1024*1024) == 0);
@@ -817,13 +818,13 @@ static void cxl_dcd_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     ct3d->cxl_cstate.pdev = pci_dev;
-    build_dvsecs(ct3d);
+    build_dvsecs(dcd);
 
     regs->special_ops = g_new0(MemoryRegionOps, 1);
     regs->special_ops->write = cxl_dcd_reg_write;
 
     cxl_component_register_block_init(OBJECT(pci_dev), cxl_cstate,
-                                      TYPE_CXL_TYPE3);
+                                      TYPE_CXL_DCD);
 
     pci_register_bar(
         pci_dev, CXL_COMPONENT_REG_BAR_IDX,
@@ -1009,14 +1010,14 @@ MemTxResult cxl_dcd_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         return MEMTX_ERROR;
     }
 
-    if (sanitize_running(&CXL_DCD(d)->dev->cxl_dstate)) {
+    if (sanitize_running(&CXL_DCD(d)->dev.cxl_dstate)) {
         qemu_guest_getrandom_nofail(data, size);
         return MEMTX_OK;
     }
     return address_space_read(as, dpa_offset, attrs, data, size);
 }
 
-MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
+MemTxResult cxl_dcd_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
                             unsigned size, MemTxAttrs attrs)
 {
     uint64_t dpa_offset = 0;
@@ -1028,7 +1029,7 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     if (res) {
         return MEMTX_ERROR;
     }
-    if (sanitize_running(&CXL_DCD(d)->dev->cxl_dstate)) {
+    if (sanitize_running(&CXL_DCD(d)->dev.cxl_dstate)) {
         return MEMTX_OK;
     }
     return address_space_write(as, dpa_offset, attrs, &data, size);
@@ -1053,7 +1054,7 @@ static Property cxl_dcd_props[] = {
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_LINK("lsa", CXLDynCapDev, dev.lsa, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
-    DEFINE_PROP_LINK("dcmemdev", CXLDynCapDev, dev.host_dc,
+    DEFINE_PROP_LINK("dcmemdev", CXLDynCapDev, host_dc,
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_UINT64("sn", CXLDynCapDev, dev.sn, UI64_NULL),
     DEFINE_PROP_STRING("cdat", CXLDynCapDev, dev.cxl_cstate.cdat.filename),
@@ -1108,7 +1109,7 @@ static void set_lsa(CXLDynCapDev *dcd, const void *buf, uint64_t size,
                     uint64_t offset)
 {
     MemoryRegion *mr;
-	CXLType3Dev ct3d = &dcd->dev;
+	CXLType3Dev *ct3d = &dcd->dev;
     void *lsa;
 
     if (!ct3d->lsa) {
@@ -1131,7 +1132,7 @@ static void set_lsa(CXLDynCapDev *dcd, const void *buf, uint64_t size,
 static bool set_cacheline(CXLDynCapDev *dcd, uint64_t dpa_offset, uint8_t *data)
 {
     MemoryRegion *vmr = NULL, *pmr = NULL;
-	CXLType3Dev ct3d = &dcd->dev;
+	CXLType3Dev *ct3d = &dcd->dev;
     AddressSpace *as;
 
     if (ct3d->hostvmem) {
@@ -1189,21 +1190,18 @@ void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog log,
     CXLEventRecordHdr *hdr = &module.hdr;
     CXLDeviceState *cxlds;
 	CXLDynCapDev *dcd;
-    uint8_t enc_log;
-    int rc;
 
     if (!obj) {
         error_setg(errp, "Unable to resolve path");
         return;
     }
     if (!object_dynamic_cast(obj, TYPE_CXL_DCD)) {
-        error_setg(errp, "Path does not point to a CXL"
-			,"dynamic capacity device");
+        error_setg(errp, "Path does not point to a CXL dynamic capacity device");
         return;
     }
 
 	dcd = CXL_DCD(obj);
-    cxlds = &dcd->cxl_dstate;
+    cxlds = &dcd->dev.cxl_dstate;
 	memset(&dCap, 0, sizeof(dCap));
 
 	/*
@@ -1240,7 +1238,7 @@ static void cxl_dcd_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
-    CXLDynCapDev *cvc = CXL_DCD_CLASS(oc);
+    CXLDcdClass *cvc = CXL_DCD_CLASS(oc);
 
     pc->realize = cxl_dcd_realize;
     pc->exit = cxl_dcd_exit;
@@ -1266,7 +1264,7 @@ static void cxl_dcd_class_init(ObjectClass *oc, void *data)
 static const TypeInfo cxl_dcd_info = {
     .name = TYPE_CXL_DCD,
     .parent = TYPE_PCI_DEVICE,
-    .class_size = sizeof(struct CXLDynCapDev),
+    .class_size = sizeof(struct CXLDcdClass),
     .class_init = cxl_dcd_class_init,
     .instance_size = sizeof(CXLDynCapDev),
     .interfaces = (InterfaceInfo[]) {
