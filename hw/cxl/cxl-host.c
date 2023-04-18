@@ -201,7 +201,8 @@ static PCIDevice *cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
         return NULL;
     }
 
-    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
+    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)
+			|| object_dynamic_cast(OBJECT(d), TYPE_CXL_DCD)) {
         return d;
     }
 
