@@ -19,5 +19,5 @@ config CXL_MEM_DEVICE
 
 config CXL_DCD
     bool
-    default y if CXL
+    default n if CXL
     select MEM_DEVICE
