@@ -384,6 +384,15 @@ typedef struct CXLPoison {
 typedef QLIST_HEAD(, CXLPoison) CXLPoisonList;
 #define CXL_POISON_LIST_LIMIT 256
 
+
+typedef struct CXLDCD_Extent_raw{
+	uint64_t start_dpa;
+	uint64_t len;
+	uint8_t tag[0x10];
+	uint16_t shared_seq;
+	uint8_t rsvd[0x6];
+}QEMU_PACKED CXLDCExtent_raw;
+
 typedef struct CXLDCD_Extent {
 	uint64_t start_dpa;
 	uint64_t len;

@@ -1713,16 +1713,16 @@ static const QemuUUID dynamic_capacity_uuid = {
 			0x95, 0x26, 0x8e, 0x10, 0x1a, 0x2a),
 };
 
-void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog log,
-		uint8_t flags, uint8_t type, uint16_t hid, uint8_t rid,
-		const char *extent, Error **errp)
+static void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog log,
+		uint8_t flags, uint8_t type, uint16_t hid, uint8_t rid, uint32_t extent_cnt,
+		const CXLDCExtent_raw *extents, Error **errp)
 {
     Object *obj = object_resolve_path(path, NULL);
-    CXLEventMemoryModule module;
 	CXLEventDynamicCapacity dCap;
-    CXLEventRecordHdr *hdr = &module.hdr;
+    CXLEventRecordHdr *hdr = &dCap.hdr;
     CXLDeviceState *cxlds;
 	CXLType3Dev *dcd;
+	int i;
 
     if (!obj) {
         error_setg(errp, "Unable to resolve path");
@@ -1759,12 +1759,61 @@ void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog log,
 	stw_le_p(&dCap.host_id, hid);
 	dCap.updated_region_id = rid;
 	/* FIXME: do we have endian issue here? */
-	memcpy(&dCap.dynamic_capacity_extent, extent, sizeof(CXLDCD_Extent));
+	for (i=0; i<extent_cnt; i++) {
+		memcpy(&dCap.dynamic_capacity_extent, &extents[i], sizeof(CXLDCExtent_raw));
 
-    if (cxl_event_insert(cxlds, CXL_EVENT_TYPE_DYNAMIC_CAP
-			, (CXLEventRecordRaw *)&module)) {
-        cxl_event_irq_assert(dcd);
-    }
+		if (cxl_event_insert(cxlds, CXL_EVENT_TYPE_DYNAMIC_CAP
+					, (CXLEventRecordRaw *)&dCap)) {
+			;
+		}
+		cxl_event_irq_assert(dcd);
+	}
+}
+
+void qmp_cxl_add_dynamic_capacity_event(const char *path,
+		uint32_t num_exent, Error **errp)
+{
+	uint8_t flags = 1 << CXL_EVENT_TYPE_INFO;
+	uint8_t region_id = 0;
+	CXLDCExtent_raw *extents;
+	int i;
+	uint64_t dpa = 0;
+
+	extents = g_new0(CXLDCExtent_raw, num_exent);
+	for (i=0; i<num_exent; i++) {
+		extents[i].start_dpa = dpa;
+		extents[i].len = 2*1024*1024;
+		memset(extents[i].tag, 0, 0x10);
+		extents[i].shared_seq = 0;
+		dpa += extents[i].len;
+	}
+
+	qmp_cxl_process_dynamic_capacity_event(path, CXL_EVENT_LOG_INFORMATIONAL,
+			flags, 0x0, 0, region_id, num_exent, extents, errp);
+	g_free(extents);
+}
+
+void qmp_cxl_release_dynamic_capacity_event(const char *path,
+		uint32_t num_exent, Error **errp)
+{
+	uint8_t flags = 1 << CXL_EVENT_TYPE_INFO;
+	uint8_t region_id = 0;
+	CXLDCExtent_raw *extents;
+	int i;
+	uint64_t dpa = 0;
+
+	extents = g_new0(CXLDCExtent_raw, num_exent);
+	for (i=0; i<num_exent; i++) {
+		extents[i].start_dpa = dpa;
+		extents[i].len = 2*1024*1024;
+		memset(extents[i].tag, 0, 0x10);
+		extents[i].shared_seq = 0;
+		dpa += extents[i].len;
+	}
+
+	qmp_cxl_process_dynamic_capacity_event(path, CXL_EVENT_LOG_INFORMATIONAL,
+			flags, 0x1, 0, region_id, num_exent, extents, errp);
+	g_free(extents);
 }
 
 static void ct3_class_init(ObjectClass *oc, void *data)

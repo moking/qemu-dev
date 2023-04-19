@@ -266,26 +266,33 @@
 }
 
 ##
-# @cxl-process-dynamic-capacity-event:
+# @cxl-add-dynamic-capacity-event:
 #
 # Command to process dynamic capacity device event, including add/clear
 #
 # @path: CXL DCD canonical QOM path
-# @log: Event Log to add the event to
-# @flags: header flags
-# @type: operation type
-# @hid: host id
-# @rid: region id
-# @extent: dynamic capacity extent to operate
+# @num-extent: number of extents to add, test only
 #
 # Since: 8.0
 ##
-{ 'command': 'cxl-process-dynamic-capacity-event',
+{ 'command': 'cxl-add-dynamic-capacity-event',
   'data': { 'path': 'str',
-            'log': 'CxlEventLog',
-			'flags':'uint8',
-			'type':'uint8',
-			'hid': 'uint16', 'rid':'uint8',
-			'extent': 'str'
+			'num-extent': 'uint32'
+  }
+}
+
+##
+# @cxl-release-dynamic-capacity-event:
+#
+# Command to process dynamic capacity device event, including add/clear
+#
+# @path: CXL DCD canonical QOM path
+# @num-extent: number of extents to add, test only
+#
+# Since: 8.0
+##
+{ 'command': 'cxl-release-dynamic-capacity-event',
+  'data': { 'path': 'str',
+			'num-extent': 'uint32'
   }
 }
