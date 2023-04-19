@@ -974,14 +974,13 @@ static CXLRetCode cmd_dcd_get_dyn_cap_config(struct cxl_cmd *cmd,
     struct get_dyn_cap_config_in_pl *in = (void *)cmd->payload;
     struct get_dyn_cap_config_out_pl *out = (void *)cmd->payload;
     struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
-    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     uint16_t record_count = 0, i = 0;
     uint16_t out_pl_len;
 
-	if (in->start_region_id >= dcd->num_regions)
+	if (in->start_region_id >= ct3d->dc.num_regions)
 		record_count = 0;
-	else if (dcd->num_regions - in->start_region_id < in->region_cnt)
-		record_count = dcd->num_regions - in->start_region_id;
+	else if (ct3d->dc.num_regions - in->start_region_id < in->region_cnt)
+		record_count = ct3d->dc.num_regions - in->start_region_id;
 	else
 		record_count = in->region_cnt;
 
@@ -992,17 +991,17 @@ static CXLRetCode cmd_dcd_get_dyn_cap_config(struct cxl_cmd *cmd,
     out->num_regions = record_count;
 	for(; i<record_count; i++){
 		stq_le_p(&out->records[i].base,
-			dcd->regions[in->start_region_id+i].base);
+			ct3d->dc.regions[in->start_region_id+i].base);
 		stq_le_p(&out->records[i].decode_len,
-			dcd->regions[in->start_region_id+i].decode_len);
+			ct3d->dc.regions[in->start_region_id+i].decode_len);
 		stq_le_p(&out->records[i].region_len,
-			dcd->regions[in->start_region_id+i].len);
+			ct3d->dc.regions[in->start_region_id+i].len);
 		stq_le_p(&out->records[i].block_size,
-			dcd->regions[in->start_region_id+i].block_size);
+			ct3d->dc.regions[in->start_region_id+i].block_size);
 		stl_le_p(&out->records[i].dsmadhandle,
-			dcd->regions[in->start_region_id+i].dsmadhandle);
+			ct3d->dc.regions[in->start_region_id+i].dsmadhandle);
 		out->records[i].flags
-			= dcd->regions[in->start_region_id+i].flags;
+			= ct3d->dc.regions[in->start_region_id+i].flags;
 	}
 
 	*len = out_pl_len;
@@ -1036,17 +1035,16 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
     struct get_dyn_cap_ext_list_in_pl *in = (void *)cmd->payload;
     struct get_dyn_cap_ext_list_out_pl *out = (void *)cmd->payload;
     struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
-    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
     uint16_t record_count = 0, i = 0, record_done=0;
-	CXLDCDExtentList *extent_list = &dcd->extents;
+	CXLDCDExtentList *extent_list = &ct3d->dc.extents;
 	CXLDCD_Extent *ent;
     uint16_t out_pl_len;
 
-	if(in->start_extent_id >= dcd->total_extent_count)
+	if(in->start_extent_id >= ct3d->dc.total_extent_count)
 		return CXL_MBOX_INVALID_INPUT;
 
-	if (dcd->total_extent_count - in->start_extent_id < in->extent_cnt)
-		record_count = dcd->total_extent_count - in->start_extent_id;
+	if (ct3d->dc.total_extent_count - in->start_extent_id < in->extent_cnt)
+		record_count = ct3d->dc.total_extent_count - in->start_extent_id;
 	else
 		record_count = in->extent_cnt;
 
@@ -1055,8 +1053,8 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
 
     memset(out, 0, out_pl_len);
     stl_le_p(&out->count, record_count);
-	stl_le_p(&out->total_extents, dcd->total_extent_count);
-	stl_le_p(&out->generation_num, dcd->ext_list_gen_seq);
+	stl_le_p(&out->total_extents, ct3d->dc.total_extent_count);
+	stl_le_p(&out->generation_num, ct3d->dc.ext_list_gen_seq);
 
     QTAILQ_FOREACH(ent, extent_list, node) {
 		if (i++ < in->start_extent_id)
@@ -1074,13 +1072,13 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
 	return CXL_MBOX_SUCCESS;
 }
 
-static CXLRetCode check_extent_range(CXLDynCapDev *dev,
+static CXLRetCode check_extent_range(CXLType3Dev *dev,
 		uint64_t dpa, uint64_t len)
 {
 	uint8_t rid = 0;
 	struct CXLDCD_Region *region;
-	for (; rid < dev->num_regions; rid ++){
-		region = &dev->regions[rid];
+	for (; rid < dev->dc.num_regions; rid ++){
+		region = &dev->dc.regions[rid];
 
 		if (dpa < region->base) {
 			return CXL_MBOX_INVALID_PA;
@@ -1097,10 +1095,10 @@ static CXLRetCode check_extent_range(CXLDynCapDev *dev,
 	return CXL_MBOX_INVALID_PA;
 }
 
-static uint8_t find_region_id(struct CXLDynCapDev *dev, uint64_t dpa) {
+static uint8_t find_region_id(struct CXLType3Dev *dev, uint64_t dpa) {
 	uint8_t i=0;
 
-	while ( i< dev->num_regions && dpa < dev->regions[i].base)
+	while ( i< dev->dc.num_regions && dpa < dev->dc.regions[i].base)
 		i ++;
 	return i;
 
@@ -1124,8 +1122,7 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
 
     struct get_dyn_cap_ext_list_in_pl *in = (void *)cmd->payload;
     struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
-    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
-    CXLDCDExtentList *extent_list = &dcd->extents;
+    CXLDCDExtentList *extent_list = &ct3d->dc.extents;
     CXLDCD_Extent *ent;
 	uint32_t i;
 	uint64_t dpa, len;
@@ -1140,7 +1137,7 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
 
 		if (dpa & 0x3f)
 			return CXL_MBOX_INVALID_EXTENT_LIST;
-		rs = check_extent_range(dcd, dpa, len);
+		rs = check_extent_range(ct3d, dpa, len);
 		if (rs)
 			return rs;
 
@@ -1163,7 +1160,7 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
 			assert(ent);
 			ent->start_dpa = dpa;
 			ent->len = len;
-			assert(find_region_id(dcd, dpa) < dcd->num_regions);
+			assert(find_region_id(ct3d, dpa) < ct3d->dc.num_regions);
 			/* FIXME: Fan
 			 * How to set tag and shared_seq;
 			 * */
@@ -1191,8 +1188,7 @@ static CXLRetCode cmd_dcd_release_dcd_capacity(struct cxl_cmd *cmd,
 
     struct release_dcd_cap_in_pl *in = (void *)cmd->payload;
     struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev, cxl_dstate);
-    struct CXLDynCapDev *dcd = container_of(ct3d, CXLDynCapDev, dev);
-    CXLDCDExtentList *extent_list = &dcd->extents;
+    CXLDCDExtentList *extent_list = &ct3d->dc.extents;
     CXLDCD_Extent *ent;
 	uint32_t i;
 	uint64_t dpa, len;
@@ -1207,7 +1203,7 @@ static CXLRetCode cmd_dcd_release_dcd_capacity(struct cxl_cmd *cmd,
 
 		if (dpa & 0x3f)
 			return CXL_MBOX_INVALID_EXTENT_LIST;
-		rs = check_extent_range(dcd, dpa, len);
+		rs = check_extent_range(ct3d, dpa, len);
 		if (rs)
 			return rs;
 

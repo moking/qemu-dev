@@ -246,25 +246,3 @@ void cxl_event_irq_assert(CXLType3Dev *ct3d)
         }
     }
 }
-
-void cxl_event_irq_assert_dcd(CXLDynCapDev *dcd)
-{
-    CXLDeviceState *cxlds = &dcd->dev.cxl_dstate;
-    PCIDevice *pdev = &dcd->dev.parent_obj;
-    int i;
-
-    for (i = 0; i < CXL_EVENT_TYPE_MAX; i++) {
-        CXLEventLog *log = &cxlds->event_logs[i];
-
-        if (!log->irq_enabled || cxl_event_empty(log)) {
-            continue;
-        }
-
-        /*  Notifies interrupt, legacy IRQ is not supported */
-        if (msix_enabled(pdev)) {
-            msix_notify(pdev, log->irq_vec);
-        } else if (msi_enabled(pdev)) {
-            msi_notify(pdev, log->irq_vec);
-        }
-    }
-}

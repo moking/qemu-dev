@@ -503,45 +503,4 @@ CXLRetCode cxl_event_clear_records(CXLDeviceState *cxlds,
 
 void cxl_event_irq_assert(CXLType3Dev *ct3d);
 void cxl_set_poison_list_overflowed(CXLType3Dev *ct3d);
-
-struct CXLDynCapDev {
-    /* Private */
-	CXLType3Dev dev;
-    HostMemoryBackend *host_dc;
-    AddressSpace host_dc_as;
-
-	uint8_t num_hosts; //Table 7-55
-	uint8_t num_regions; // 1-8
-	uint8_t sanitize_mask; // sanitize on release configuration support mask
-	uint16_t cap_add_policy; // only bits 0-2 used, bit 3 should be 0
-	uint16_t cap_removal_policy; // only bits 0-1 used, bit 3 should be 0
-	struct CXLDCD_Region regions[DCD_MAX_REGION_NUM];
-	uint64_t block_size_marks[DCD_MAX_REGION_NUM];
-	uint32_t total_extent_count;
-	uint32_t ext_list_gen_seq;
-	uint64_t total_dynamic_capicity; // 256M aligned
-	CXLDCDExtentList extents;
-};
-
-/* FIXME: Fan */
-#define TYPE_CXL_DCD "cxl-dcd"
-OBJECT_DECLARE_TYPE(CXLDynCapDev, CXLDcdClass, CXL_DCD)
-
-struct CXLDcdClass {
-    /* Private */
-    PCIDeviceClass parent_class;
-
-    /* public */
-    uint64_t (*get_lsa_size)(CXLDynCapDev *dcd);
-
-    uint64_t (*get_lsa)(CXLDynCapDev *dcd, void *buf, uint64_t size,
-                        uint64_t offset);
-    void (*set_lsa)(CXLDynCapDev *dcd, const void *buf, uint64_t size,
-                    uint64_t offset);
-    bool (*set_cacheline)(CXLDynCapDev *dcd, uint64_t dpa_offset, uint8_t *data);
-};
-
-
-
-void cxl_event_irq_assert_dcd(CXLDynCapDev *dcd);
 #endif
