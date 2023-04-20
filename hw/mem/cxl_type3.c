@@ -719,6 +719,25 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
     }
 }
 
+/*
+ * For testing only
+ */
+static void cxl_create_toy_regions(CXLType3Dev *ct3d){
+	int i;
+	uint64_t region_base = ct3d->hostvmem?ct3d->hostvmem->size + ct3d->hostpmem->size:ct3d->hostpmem->size;
+	uint64_t region_len = 256*1024*1024;
+	uint64_t decode_len = 1;
+
+	for (i=0; i<ct3d->dc.num_regions; i++){
+		ct3d->dc.regions[i].base = region_base;
+		ct3d->dc.regions[i].decode_len = decode_len;
+		ct3d->dc.regions[i].len = region_len;
+		ct3d->dc.regions[i].block_size = 2*1024*1024;
+		/* dsmad_handle is set when creating cdat table entries */
+		ct3d->dc.regions[i].flags = 0;
+	}
+}
+
 static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
 {
     DeviceState *ds = DEVICE(ct3d);
@@ -808,13 +827,16 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         }
         address_space_init(&ct3d->dc.host_dc_as, dc_mr, dc_name);
 
+		cxl_create_toy_regions(ct3d);
+		QTAILQ_INIT(&ct3d->dc.extents);
+
 		for (i=0; i<ct3d->dc.num_regions; i++) {
 			total_region_size += ct3d->dc.regions[i].len;
 		}
 		assert(total_region_size <= dc_mr->size);
 		assert(dc_mr->size %(256*1024*1024) == 0);
 
-        ct3d->dc.total_dynamic_capicity = dc_mr->size;
+        ct3d->dc.total_dynamic_capicity = total_region_size;
         g_free(dc_name);
     }
  
@@ -837,25 +859,6 @@ static DOEProtocol doe_spdm_prot[] = {
     { }
 };
 
-/*
- * For testing only
- */
-static void create_toy_regions(CXLType3Dev *ct3d){
-	int i;
-	uint64_t region_base = ct3d->hostvmem?ct3d->hostvmem->size + ct3d->hostpmem->size:ct3d->hostpmem->size;
-	uint64_t region_len = 256*1024*1024;
-	uint64_t decode_len = 1;
-
-	for (i=0; i<ct3d->dc.num_regions; i++){
-		ct3d->dc.regions[i].base = region_base;
-		ct3d->dc.regions[i].decode_len = decode_len;
-		ct3d->dc.regions[i].len = region_len;
-		ct3d->dc.regions[i].block_size = 2*1024*1024;
-		/* dsmad_handle is set when creating cdat table entries */
-		ct3d->dc.regions[i].flags = 0;
-	}
-}
-
 static void ct3_realize(PCIDevice *pci_dev, Error **errp)
 {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
@@ -872,7 +875,6 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
-	create_toy_regions(ct3d);
 
     pci_config_set_prog_interface(pci_conf, 0x10);
 
@@ -1715,7 +1717,7 @@ static const QemuUUID dynamic_capacity_uuid = {
 
 static void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog log,
 		uint8_t flags, uint8_t type, uint16_t hid, uint8_t rid, uint32_t extent_cnt,
-		const CXLDCExtent_raw *extents, Error **errp)
+		CXLDCExtent_raw *extents, Error **errp)
 {
     Object *obj = object_resolve_path(path, NULL);
 	CXLEventDynamicCapacity dCap;
@@ -1760,6 +1762,7 @@ static void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog
 	dCap.updated_region_id = rid;
 	/* FIXME: do we have endian issue here? */
 	for (i=0; i<extent_cnt; i++) {
+		extents[i].start_dpa += dcd->dc.regions[rid].base;
 		memcpy(&dCap.dynamic_capacity_extent, &extents[i], sizeof(CXLDCExtent_raw));
 
 		if (cxl_event_insert(cxlds, CXL_EVENT_TYPE_DYNAMIC_CAP
