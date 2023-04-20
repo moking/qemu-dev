@@ -1209,13 +1209,11 @@ static CXLRetCode cmd_dcd_release_dcd_capacity(struct cxl_cmd *cmd,
 
 		QTAILQ_FOREACH(ent, extent_list, node) {
 			if (ent->start_dpa == dpa && ent->len == len)
-				return CXL_MBOX_INVALID_PA;
-			if (ent->start_dpa <= dpa
-				&& dpa + len <= ent->start_dpa + ent->len) {
-				ent->start_dpa = dpa;
-				ent->len = len;
 				break;
-			} else if ((dpa < ent->start_dpa + ent->len
+			/*
+			 *FIXME: need to cover the case where CXL_MBOX_INVALID_PA is returned
+			 * */
+			else if ((dpa < ent->start_dpa + ent->len
 				&& dpa + len > ent->start_dpa + ent->len)
 				|| (dpa < ent->start_dpa && dpa + len > ent->start_dpa))
 				return CXL_MBOX_INVALID_EXTENT_LIST;

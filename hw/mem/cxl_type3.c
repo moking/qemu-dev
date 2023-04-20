@@ -1808,7 +1808,7 @@ void qmp_cxl_release_dynamic_capacity_event(const char *path,
 	extents = g_new0(CXLDCExtent_raw, num_exent);
 	for (i=0; i<num_exent; i++) {
 		extents[i].start_dpa = dpa;
-		extents[i].len = 2*1024*1024;
+		extents[i].len = 128*1024*1024;
 		memset(extents[i].tag, 0, 0x10);
 		extents[i].shared_seq = 0;
 		dpa += extents[i].len;
