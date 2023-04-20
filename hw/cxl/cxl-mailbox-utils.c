@@ -1040,7 +1040,7 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
 	CXLDCD_Extent *ent;
     uint16_t out_pl_len;
 
-	if(in->start_extent_id >= ct3d->dc.total_extent_count)
+	if(in->start_extent_id > ct3d->dc.total_extent_count)
 		return CXL_MBOX_INVALID_INPUT;
 
 	if (ct3d->dc.total_extent_count - in->start_extent_id < in->extent_cnt)
