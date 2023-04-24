@@ -445,6 +445,7 @@ static void ct3d_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
  */
 #define UI64_NULL ~(0ULL)
 
+/* FIXME: do we need to anything about the dynamic capacity?? */
 static void build_dvsecs(CXLType3Dev *ct3d)
 {
     CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
@@ -779,7 +780,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         }
         address_space_init(&ct3d->hostvmem_as, vmr, v_name);
         ct3d->cxl_dstate.vmem_size = vmr->size;
-        ct3d->cxl_dstate.mem_size += vmr->size;
+        ct3d->cxl_dstate.static_mem_size += vmr->size;
         g_free(v_name);
     }
 
@@ -802,10 +803,11 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         }
         address_space_init(&ct3d->hostpmem_as, pmr, p_name);
         ct3d->cxl_dstate.pmem_size = pmr->size;
-        ct3d->cxl_dstate.mem_size += pmr->size;
+        ct3d->cxl_dstate.static_mem_size += pmr->size;
         g_free(p_name);
     }
 
+	ct3d->dc.total_dynamic_capicity = 0;
     if (ct3d->dc.host_dc) {
         MemoryRegion *dc_mr;
         char *dc_name;
@@ -947,6 +949,9 @@ err_release_cdat:
 err_free_special_ops:
     g_free(regs->special_ops);
 err_address_space_free:
+	if(ct3d->dc.host_dc) {
+        address_space_destroy(&ct3d->dc.host_dc_as);
+	}
     if (ct3d->hostpmem) {
         address_space_destroy(&ct3d->hostpmem_as);
     }
@@ -972,6 +977,9 @@ static void ct3_exit(PCIDevice *pci_dev)
     if (ct3d->hostvmem) {
         address_space_destroy(&ct3d->hostvmem_as);
     }
+	if(ct3d->dc.host_dc) {
+        address_space_destroy(&ct3d->dc.host_dc_as);
+	}
 }
 
 static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
@@ -1030,7 +1038,7 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
                                        AddressSpace **as,
                                        uint64_t *dpa_offset)
 {
-    MemoryRegion *vmr = NULL, *pmr = NULL;
+    MemoryRegion *vmr = NULL, *pmr = NULL, *dc_mr = NULL;
 
     if (ct3d->hostvmem) {
         vmr = host_memory_backend_get_memory(ct3d->hostvmem);
@@ -1038,8 +1046,11 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
     if (ct3d->hostpmem) {
         pmr = host_memory_backend_get_memory(ct3d->hostpmem);
     }
+    if (ct3d->dc.host_dc) {
+        dc_mr = host_memory_backend_get_memory(ct3d->dc.host_dc);
+    }
 
-    if (!vmr && !pmr) {
+    if (!vmr && !pmr && !dc_mr) {
         return -ENODEV;
     }
 
@@ -1047,7 +1058,12 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
         return -EINVAL;
     }
 
-    if (*dpa_offset > int128_get64(ct3d->cxl_dstate.mem_size)) {
+    if (*dpa_offset >= int128_get64(ct3d->cxl_dstate.static_mem_size)
+			+ ct3d->dc.total_dynamic_capicity)
+		return -EINVAL;
+
+    if (*dpa_offset >= int128_get64(ct3d->cxl_dstate.static_mem_size)
+			&& ct3d->dc.num_regions == 0) {
         return -EINVAL;
     }
 
@@ -1055,11 +1071,30 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
         if (*dpa_offset < int128_get64(vmr->size)) {
             *as = &ct3d->hostvmem_as;
         } else {
-            *as = &ct3d->hostpmem_as;
-            *dpa_offset -= vmr->size;
+			if (pmr) {
+				if (*dpa_offset < int128_get64(ct3d->cxl_dstate.static_mem_size)) {
+						*as = &ct3d->hostpmem_as;
+						*dpa_offset -= vmr->size;
+				} else {
+					*as = &ct3d->dc.host_dc_as;
+					*dpa_offset -= (vmr->size + pmr->size);
+				}
+			} else {
+				*as = &ct3d->dc.host_dc_as;
+				*dpa_offset -= vmr->size;
+			}
         }
     } else {
-        *as = &ct3d->hostpmem_as;
+		if (pmr) {
+			if (*dpa_offset < int128_get64(pmr->size))
+				*as = &ct3d->hostpmem_as;
+			else {
+				*as = &ct3d->dc.host_dc_as;
+				*dpa_offset -= pmr->size;
+			}
+		} else {
+			*as = &ct3d->dc.host_dc_as;
+		}
     }
 
     return 0;
@@ -1194,7 +1229,7 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
 
 static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
 {
-    MemoryRegion *vmr = NULL, *pmr = NULL;
+    MemoryRegion *vmr = NULL, *pmr = NULL, *dc_mr = NULL;
     AddressSpace *as;
 
     if (ct3d->hostvmem) {
@@ -1203,24 +1238,51 @@ static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
     if (ct3d->hostpmem) {
         pmr = host_memory_backend_get_memory(ct3d->hostpmem);
     }
+    if (ct3d->dc.host_dc) {
+        dc_mr = host_memory_backend_get_memory(ct3d->dc.host_dc);
+    }
 
-    if (!vmr && !pmr) {
+    if (!vmr && !pmr && !dc_mr) {
         return false;
     }
 
-    if (dpa_offset + 64 > int128_get64(ct3d->cxl_dstate.mem_size)) {
+    if (dpa_offset >= int128_get64(ct3d->cxl_dstate.static_mem_size)
+			+ ct3d->dc.total_dynamic_capicity)
+		return false;
+
+    if (dpa_offset + 64 >= int128_get64(ct3d->cxl_dstate.static_mem_size)
+			&& ct3d->dc.num_regions == 0) {
         return false;
     }
 
     if (vmr) {
-        if (dpa_offset <= int128_get64(vmr->size)) {
+        if (dpa_offset < int128_get64(vmr->size)) {
             as = &ct3d->hostvmem_as;
         } else {
-            as = &ct3d->hostpmem_as;
-            dpa_offset -= vmr->size;
+			if (pmr) {
+				if (dpa_offset < int128_get64(ct3d->cxl_dstate.static_mem_size)) {
+						as = &ct3d->hostpmem_as;
+						dpa_offset -= vmr->size;
+				} else {
+					as = &ct3d->dc.host_dc_as;
+					dpa_offset -= (vmr->size + pmr->size);
+				}
+			} else {
+				as = &ct3d->dc.host_dc_as;
+				dpa_offset -= vmr->size;
+			}
         }
     } else {
-        as = &ct3d->hostpmem_as;
+		if (pmr) {
+			if (dpa_offset < int128_get64(pmr->size))
+				as = &ct3d->hostpmem_as;
+			else {
+				as = &ct3d->dc.host_dc_as;
+				dpa_offset -= pmr->size;
+			}
+		} else {
+			as = &ct3d->dc.host_dc_as;
+		}
     }
 
     address_space_write(as, dpa_offset, MEMTXATTRS_UNSPECIFIED, &data, 64);
