@@ -726,8 +726,8 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
 static void cxl_create_toy_regions(CXLType3Dev *ct3d){
 	int i;
 	uint64_t region_base = ct3d->hostvmem?ct3d->hostvmem->size + ct3d->hostpmem->size:ct3d->hostpmem->size;
-	uint64_t region_len = 256*1024*1024;
-	uint64_t decode_len = 1;
+	uint64_t region_len = 1024*1024*1024;
+	uint64_t decode_len = 4; /* 4*256MB */
 
 	for (i=0; i<ct3d->dc.num_regions; i++){
 		ct3d->dc.regions[i].base = region_base;
@@ -1835,19 +1835,23 @@ static void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog
 	}
 }
 
-void qmp_cxl_add_dynamic_capacity_event(const char *path,
-		uint32_t num_exent, Error **errp)
+#define MEM_BLK_SIZE_MB 128
+void qmp_cxl_add_dynamic_capacity_event(const char *path, uint8_t region_id,
+		uint32_t num_exent, uint64_t dpa, uint64_t extent_len_MB, Error **errp)
 {
 	uint8_t flags = 1 << CXL_EVENT_TYPE_INFO;
-	uint8_t region_id = 0;
 	CXLDCExtent_raw *extents;
 	int i;
-	uint64_t dpa = 0;
+
+	if (extent_len_MB < MEM_BLK_SIZE_MB) {
+        error_setg(errp, "extent size cannot be smaller than memory block size (%dMB)", MEM_BLK_SIZE_MB);
+		return;
+	}
 
 	extents = g_new0(CXLDCExtent_raw, num_exent);
 	for (i=0; i<num_exent; i++) {
 		extents[i].start_dpa = dpa;
-		extents[i].len = 128*1024*1024;
+		extents[i].len = extent_len_MB*1024*1024;
 		memset(extents[i].tag, 0, 0x10);
 		extents[i].shared_seq = 0;
 		dpa += extents[i].len;
@@ -1858,19 +1862,22 @@ void qmp_cxl_add_dynamic_capacity_event(const char *path,
 	g_free(extents);
 }
 
-void qmp_cxl_release_dynamic_capacity_event(const char *path,
-		uint32_t num_exent, Error **errp)
+void qmp_cxl_release_dynamic_capacity_event(const char *path, uint8_t region_id,
+		uint32_t num_exent, uint64_t dpa, uint64_t extent_len_MB, Error **errp)
 {
 	uint8_t flags = 1 << CXL_EVENT_TYPE_INFO;
-	uint8_t region_id = 0;
 	CXLDCExtent_raw *extents;
 	int i;
-	uint64_t dpa = 0;
+
+	if (extent_len_MB < MEM_BLK_SIZE_MB) {
+        error_setg(errp, "extent size cannot be smaller than memory block size (%dMB)", MEM_BLK_SIZE_MB);
+		return;
+	}
 
 	extents = g_new0(CXLDCExtent_raw, num_exent);
 	for (i=0; i<num_exent; i++) {
 		extents[i].start_dpa = dpa;
-		extents[i].len = 128*1024*1024;
+		extents[i].len = extent_len_MB*1024*1024;
 		memset(extents[i].tag, 0, 0x10);
 		extents[i].shared_seq = 0;
 		dpa += extents[i].len;
