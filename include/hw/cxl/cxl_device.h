@@ -404,14 +404,16 @@ typedef struct CXLDCD_Extent {
 }CXLDCD_Extent;
 typedef QTAILQ_HEAD(, CXLDCD_Extent) CXLDCDExtentList;
 
-struct CXLDCD_Region {
+typedef struct CXLDCD_Region {
 	uint64_t base;
 	uint64_t decode_len; /* in multiples of 256MB */
 	uint64_t len;
 	uint64_t block_size;
 	uint32_t dsmadhandle;
 	uint8_t flags;
-};
+
+	unsigned long *blk_bitmap;
+}CXLDCD_Region;
 
 #define DCD_MAX_REGION_NUM 8
 

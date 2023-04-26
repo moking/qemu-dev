@@ -18,6 +18,7 @@
 #include "hw/cxl/cxl.h"
 #include "hw/pci/msix.h"
 #include "hw/pci/spdm.h"
+#include "qemu/bitmap.h"
 
 #define DWORD_BYTE 4
 
@@ -164,7 +165,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     int len = 0;
     int rc, i;
 
-    if (!ct3d->hostpmem && !ct3d->hostvmem) {
+    if (!ct3d->hostpmem && !ct3d->hostvmem && !ct3d->dc.num_regions) {
         return 0;
     }
 
@@ -723,19 +724,40 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
 /*
  * For testing only
  */
-static void cxl_create_toy_regions(CXLType3Dev *ct3d){
+static int cxl_create_toy_regions(CXLType3Dev *ct3d){
 	int i;
 	uint64_t region_base = ct3d->hostvmem?ct3d->hostvmem->size + ct3d->hostpmem->size:ct3d->hostpmem->size;
 	uint64_t region_len = 1024*1024*1024;
 	uint64_t decode_len = 4; /* 4*256MB */
+	uint64_t blk_size = 2*1024*1024;
+	struct CXLDCD_Region *region;
+
+	for (i=0; i<ct3d->dc.num_regions; i++) {
+		region = &ct3d->dc.regions[i];
+		region->base = region_base;
+		region->decode_len = decode_len;
+		region->len = region_len;
+		region->block_size = blk_size;
+		/* dsmad_handle is set when creating cdat table entries */
+		region->flags = 0;
+
+		region->blk_bitmap = bitmap_new(region->len/region->block_size);
+		if (!region->blk_bitmap)
+			return -1;
+		bitmap_zero(region->blk_bitmap, region->len/region->block_size);
+
+		region_base += region->len;
+	}
+	return 0;
+}
+
+static void cxl_destroy_toy_regions(CXLType3Dev *ct3d){
+	int i;
+	struct CXLDCD_Region *region;
 
 	for (i=0; i<ct3d->dc.num_regions; i++){
-		ct3d->dc.regions[i].base = region_base;
-		ct3d->dc.regions[i].decode_len = decode_len;
-		ct3d->dc.regions[i].len = region_len;
-		ct3d->dc.regions[i].block_size = 2*1024*1024;
-		/* dsmad_handle is set when creating cdat table entries */
-		ct3d->dc.regions[i].flags = 0;
+		region = &ct3d->dc.regions[i];
+		g_free(region->blk_bitmap);
 	}
 }
 
@@ -829,7 +851,9 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         }
         address_space_init(&ct3d->dc.host_dc_as, dc_mr, dc_name);
 
-		cxl_create_toy_regions(ct3d);
+		if (cxl_create_toy_regions(ct3d)) {
+			return false;
+		}
 		QTAILQ_INIT(&ct3d->dc.extents);
 
 		for (i=0; i<ct3d->dc.num_regions; i++) {
@@ -972,6 +996,7 @@ static void ct3_exit(PCIDevice *pci_dev)
     spdm_sock_fini(ct3d->doe_spdm.socket);
     g_free(regs->special_ops);
     if (ct3d->hostpmem) {
+		cxl_destroy_toy_regions(ct3d);
         address_space_destroy(&ct3d->hostpmem_as);
     }
     if (ct3d->hostvmem) {
@@ -979,6 +1004,77 @@ static void ct3_exit(PCIDevice *pci_dev)
     }
 	if(ct3d->dc.host_dc) {
         address_space_destroy(&ct3d->dc.host_dc_as);
+	}
+}
+
+static void set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
+		uint64_t len) {
+	int i;
+	CXLDCD_Region *region = NULL;
+
+	if (dpa < ct3d->dc.regions[0].base
+		   || dpa >= ct3d->dc.regions[0].base + ct3d->dc.total_dynamic_capicity)
+		return;
+	
+	for (i=ct3d->dc.num_regions-1; i>=0; i--) {
+		region = &ct3d->dc.regions[i];
+		if (dpa >= region->base)
+			break;
+	}
+	bitmap_set(region->blk_bitmap, (dpa-region->base)/region->block_size,
+			len/region->block_size);
+}
+
+static bool test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
+		uint64_t len) {
+	int i;
+	CXLDCD_Region *region = NULL;
+	uint64_t nbits;
+	long nr;
+
+	if (dpa < ct3d->dc.regions[0].base
+		   || dpa >= ct3d->dc.regions[0].base + ct3d->dc.total_dynamic_capicity)
+		return false;
+	
+	for (i=ct3d->dc.num_regions-1; i>=0; i--) {
+		region = &ct3d->dc.regions[i];
+		if (dpa >= region->base)
+			break;
+	}
+
+	nr = (dpa-region->base)/region->block_size;
+	nbits = (len + region->block_size-1)/region->block_size;
+	for (i=0; i<nbits; i++){
+		if (!test_bit(nr, region->blk_bitmap))
+			return false;
+		nr ++;
+	}
+
+	return true;
+}
+
+static void clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
+		uint64_t len) {
+	int i;
+	CXLDCD_Region *region = NULL;
+	uint64_t nbits;
+	long nr;
+
+	if (dpa < ct3d->dc.regions[0].base
+		   || dpa >= ct3d->dc.regions[0].base + ct3d->dc.total_dynamic_capicity)
+		return;
+	
+	for (i=ct3d->dc.num_regions-1; i>=0; i--) {
+		region = &ct3d->dc.regions[i];
+		if (dpa >= region->base)
+			break;
+	}
+
+	nr = (dpa-region->base)/region->block_size;
+	nbits = (len + region->block_size-1)/region->block_size;
+	for (i=0; i<nbits; i++){
+		clear_bit(nr, region->blk_bitmap);
+		nr ++;
 	}
 }
 
@@ -1076,10 +1172,14 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 						*as = &ct3d->hostpmem_as;
 						*dpa_offset -= vmr->size;
 				} else {
+					if (!test_region_block_backed(ct3d, *dpa_offset, size))
+							return -ENODEV;
 					*as = &ct3d->dc.host_dc_as;
 					*dpa_offset -= (vmr->size + pmr->size);
 				}
 			} else {
+				if (!test_region_block_backed(ct3d, *dpa_offset, size))
+					return -ENODEV;
 				*as = &ct3d->dc.host_dc_as;
 				*dpa_offset -= vmr->size;
 			}
@@ -1089,10 +1189,14 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 			if (*dpa_offset < int128_get64(pmr->size))
 				*as = &ct3d->hostpmem_as;
 			else {
+				if (!test_region_block_backed(ct3d, *dpa_offset, size))
+					return -ENODEV;
 				*as = &ct3d->dc.host_dc_as;
 				*dpa_offset -= pmr->size;
 			}
 		} else {
+			if (!test_region_block_backed(ct3d, *dpa_offset, size))
+				return -ENODEV;
 			*as = &ct3d->dc.host_dc_as;
 		}
     }
@@ -1825,6 +1929,12 @@ static void qmp_cxl_process_dynamic_capacity_event(const char *path, CxlEventLog
 	/* FIXME: do we have endian issue here? */
 	for (i=0; i<extent_cnt; i++) {
 		extents[i].start_dpa += dcd->dc.regions[rid].base;
+		if (dCap.type == 0x0)
+			set_region_block_backed(dcd, extents[i].start_dpa, extents[i].len);
+		else if (dCap.type == 0x1)
+			clear_region_block_backed(dcd, extents[i].start_dpa, extents[i].len);
+		else
+			error_setg(errp, "DC event not support yet, no bitmap op");
 		memcpy(&dCap.dynamic_capacity_extent, &extents[i], sizeof(CXLDCExtent_raw));
 
 		if (cxl_event_insert(cxlds, CXL_EVENT_TYPE_DYNAMIC_CAP
