@@ -164,6 +164,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     int cur_ent = 0;
     int len = 0;
     int rc, i;
+	uint64_t vmr_size = 0, pmr_size = 0;
 
     if (!ct3d->hostpmem && !ct3d->hostvmem && !ct3d->dc.num_regions) {
         return 0;
@@ -175,6 +176,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
             return -EINVAL;
         }
         len += CT3_CDAT_NUM_ENTRIES;
+		vmr_size = volatile_mr->size;
     }
 
     if (ct3d->hostpmem) {
@@ -183,6 +185,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
             return -EINVAL;
         }
         len += CT3_CDAT_NUM_ENTRIES;
+		pmr_size = nonvolatile_mr->size;
     }
 
 	if (ct3d->dc.num_regions) {
@@ -205,7 +208,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     /* Now fill them in */
     if (volatile_mr) {
         rc = ct3_build_cdat_entries_for_mr(table, dsmad_handle++,
-				0, 0, int128_get64(volatile_mr->size));
+				0, 0, vmr_size);
         if (rc < 0) {
             return rc;
         }
@@ -214,7 +217,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 
     if (nonvolatile_mr) {
         rc = ct3_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
-                CDAT_DSMAS_FLAG_NV, (volatile_mr ? volatile_mr->size : 0), int128_get64(nonvolatile_mr->size));
+                CDAT_DSMAS_FLAG_NV, vmr_size, pmr_size);
         if (rc < 0) {
             goto error_cleanup;
         }
@@ -222,7 +225,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     }
 
     if (dc_mr) {
-		uint64_t region_base = volatile_mr ? volatile_mr->size+nonvolatile_mr->size: nonvolatile_mr->size;
+		uint64_t region_base = vmr_size + pmr_size;
 
 		/*
 		 * Currently we create cdat entries for each region, should we only create dsmas table instead??
@@ -230,8 +233,10 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 		 *
 		 */
 		for (i=0; i<ct3d->dc.num_regions; i++) {
-			rc = ct3_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
-				CDAT_DSMAS_FLAG_NV|CDAT_DSMAS_FLAG_DYNAMIC_CAP, region_base, ct3d->dc.regions[i].len);
+			rc = ct3_build_cdat_entries_for_mr(&(table[cur_ent])
+					, dsmad_handle++
+					, CDAT_DSMAS_FLAG_NV|CDAT_DSMAS_FLAG_DYNAMIC_CAP
+					, region_base, ct3d->dc.regions[i].len);
 			if (rc < 0) {
 				goto error_cleanup;
 			}
@@ -748,6 +753,8 @@ static int cxl_create_toy_regions(CXLType3Dev *ct3d){
 
 		region_base += region->len;
 	}
+
+	QTAILQ_INIT(&ct3d->dc.extents);
 	return 0;
 }
 
@@ -765,7 +772,8 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
 {
     DeviceState *ds = DEVICE(ct3d);
 
-    if (!ct3d->hostmem && !ct3d->hostvmem && !ct3d->hostpmem) {
+    if (!ct3d->hostmem && !ct3d->hostvmem && !ct3d->hostpmem
+			&& !ct3d->dc.num_regions) {
         error_setg(errp, "at least one memdev property must be set");
         return false;
     } else if (ct3d->hostmem && ct3d->hostpmem) {
@@ -841,6 +849,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
             error_setg(errp, "dynamic capacity must have backing device");
             return false;
         }
+		/* FIXME: set dc as nonvolatile for now */
         memory_region_set_nonvolatile(dc_mr, true);
         memory_region_set_enabled(dc_mr, true);
         host_memory_backend_set_mapped(ct3d->dc.host_dc, true);
@@ -854,7 +863,6 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
 		if (cxl_create_toy_regions(ct3d)) {
 			return false;
 		}
-		QTAILQ_INIT(&ct3d->dc.extents);
 
 		for (i=0; i<ct3d->dc.num_regions; i++) {
 			total_region_size += ct3d->dc.regions[i].len;
@@ -995,16 +1003,16 @@ static void ct3_exit(PCIDevice *pci_dev)
     cxl_doe_cdat_release(cxl_cstate);
     spdm_sock_fini(ct3d->doe_spdm.socket);
     g_free(regs->special_ops);
-    if (ct3d->hostpmem) {
+	if(ct3d->dc.host_dc) {
 		cxl_destroy_toy_regions(ct3d);
+        address_space_destroy(&ct3d->dc.host_dc_as);
+	}
+    if (ct3d->hostpmem) {
         address_space_destroy(&ct3d->hostpmem_as);
     }
     if (ct3d->hostvmem) {
         address_space_destroy(&ct3d->hostvmem_as);
     }
-	if(ct3d->dc.host_dc) {
-        address_space_destroy(&ct3d->dc.host_dc_as);
-	}
 }
 
 static void set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
@@ -1016,11 +1024,19 @@ static void set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
 		   || dpa >= ct3d->dc.regions[0].base + ct3d->dc.total_dynamic_capicity)
 		return;
 	
+	/* 
+	 * spec 3.0 9.13.3: Regions are used in increasing-DPA order, with
+	 * Region 0 being used for the lowest DPA of Dynamic Capacity and
+	 * Region 7 for the highest DPA.
+	 * So we check from the last region to find where the dpa belongs.
+	 * access across multiple regions is not allowed.
+	 * */
 	for (i=ct3d->dc.num_regions-1; i>=0; i--) {
 		region = &ct3d->dc.regions[i];
 		if (dpa >= region->base)
 			break;
 	}
+
 	bitmap_set(region->blk_bitmap, (dpa-region->base)/region->block_size,
 			len/region->block_size);
 }
@@ -1035,7 +1051,14 @@ static bool test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
 	if (dpa < ct3d->dc.regions[0].base
 		   || dpa >= ct3d->dc.regions[0].base + ct3d->dc.total_dynamic_capicity)
 		return false;
-	
+
+	/* 
+	 * spec 3.0 9.13.3: Regions are used in increasing-DPA order, with
+	 * Region 0 being used for the lowest DPA of Dynamic Capacity and
+	 * Region 7 for the highest DPA.
+	 * So we check from the last region to find where the dpa belongs.
+	 * access across multiple regions is not allowed.
+	 * */
 	for (i=ct3d->dc.num_regions-1; i>=0; i--) {
 		region = &ct3d->dc.regions[i];
 		if (dpa >= region->base)
@@ -1064,6 +1087,13 @@ static void clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
 		   || dpa >= ct3d->dc.regions[0].base + ct3d->dc.total_dynamic_capicity)
 		return;
 	
+	/* 
+	 * spec 3.0 9.13.3: Regions are used in increasing-DPA order, with
+	 * Region 0 being used for the lowest DPA of Dynamic Capacity and
+	 * Region 7 for the highest DPA.
+	 * So we check from the last region to find where the dpa belongs.
+	 * access across multiple regions is not allowed.
+	 * */
 	for (i=ct3d->dc.num_regions-1; i>=0; i--) {
 		region = &ct3d->dc.regions[i];
 		if (dpa >= region->base)
@@ -1135,15 +1165,19 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
                                        uint64_t *dpa_offset)
 {
     MemoryRegion *vmr = NULL, *pmr = NULL, *dc_mr = NULL;
+	uint64_t vmr_size = 0, pmr_size = 0, dc_size = 0;
 
     if (ct3d->hostvmem) {
         vmr = host_memory_backend_get_memory(ct3d->hostvmem);
+		vmr_size = int128_get64(vmr->size);
     }
     if (ct3d->hostpmem) {
         pmr = host_memory_backend_get_memory(ct3d->hostpmem);
+		pmr_size = int128_get64(pmr->size);
     }
     if (ct3d->dc.host_dc) {
         dc_mr = host_memory_backend_get_memory(ct3d->dc.host_dc);
+		dc_size = ct3d->dc.total_dynamic_capicity;
     }
 
     if (!vmr && !pmr && !dc_mr) {
@@ -1154,52 +1188,24 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
         return -EINVAL;
     }
 
-    if (*dpa_offset >= int128_get64(ct3d->cxl_dstate.static_mem_size)
-			+ ct3d->dc.total_dynamic_capicity)
+    if (*dpa_offset >= vmr_size + pmr_size + dc_size)
 		return -EINVAL;
 
-    if (*dpa_offset >= int128_get64(ct3d->cxl_dstate.static_mem_size)
-			&& ct3d->dc.num_regions == 0) {
+    if (*dpa_offset >= vmr_size + pmr_size && ct3d->dc.num_regions == 0) {
         return -EINVAL;
     }
 
-    if (vmr) {
-        if (*dpa_offset < int128_get64(vmr->size)) {
-            *as = &ct3d->hostvmem_as;
-        } else {
-			if (pmr) {
-				if (*dpa_offset < int128_get64(ct3d->cxl_dstate.static_mem_size)) {
-						*as = &ct3d->hostpmem_as;
-						*dpa_offset -= vmr->size;
-				} else {
-					if (!test_region_block_backed(ct3d, *dpa_offset, size))
-							return -ENODEV;
-					*as = &ct3d->dc.host_dc_as;
-					*dpa_offset -= (vmr->size + pmr->size);
-				}
-			} else {
-				if (!test_region_block_backed(ct3d, *dpa_offset, size))
-					return -ENODEV;
-				*as = &ct3d->dc.host_dc_as;
-				*dpa_offset -= vmr->size;
-			}
-        }
-    } else {
-		if (pmr) {
-			if (*dpa_offset < int128_get64(pmr->size))
-				*as = &ct3d->hostpmem_as;
-			else {
-				if (!test_region_block_backed(ct3d, *dpa_offset, size))
-					return -ENODEV;
-				*as = &ct3d->dc.host_dc_as;
-				*dpa_offset -= pmr->size;
-			}
-		} else {
-			if (!test_region_block_backed(ct3d, *dpa_offset, size))
-				return -ENODEV;
-			*as = &ct3d->dc.host_dc_as;
-		}
-    }
+	if (*dpa_offset < vmr_size)
+		*as = &ct3d->hostvmem_as;
+	else if (*dpa_offset < vmr_size + pmr_size) {
+		*as = &ct3d->hostpmem_as;
+		*dpa_offset -= vmr_size;
+	} else {
+		if (!test_region_block_backed(ct3d, *dpa_offset, size))
+			return -ENODEV;
+		*as = &ct3d->dc.host_dc_as;
+		*dpa_offset -= (vmr_size + pmr_size);
+	}
 
     return 0;
 }
@@ -1335,59 +1341,41 @@ static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
 {
     MemoryRegion *vmr = NULL, *pmr = NULL, *dc_mr = NULL;
     AddressSpace *as;
+	uint64_t vmr_size = 0, pmr_size = 0, dc_size = 0;
 
     if (ct3d->hostvmem) {
         vmr = host_memory_backend_get_memory(ct3d->hostvmem);
+		vmr_size = int128_get64(vmr->size);
     }
     if (ct3d->hostpmem) {
         pmr = host_memory_backend_get_memory(ct3d->hostpmem);
+		pmr_size = int128_get64(pmr->size);
     }
     if (ct3d->dc.host_dc) {
         dc_mr = host_memory_backend_get_memory(ct3d->dc.host_dc);
+		dc_size = ct3d->dc.total_dynamic_capicity;
     }
 
     if (!vmr && !pmr && !dc_mr) {
         return false;
     }
 
-    if (dpa_offset >= int128_get64(ct3d->cxl_dstate.static_mem_size)
-			+ ct3d->dc.total_dynamic_capicity)
+	if (dpa_offset >= vmr_size + pmr_size + dc_size)
 		return false;
 
-    if (dpa_offset + 64 >= int128_get64(ct3d->cxl_dstate.static_mem_size)
-			&& ct3d->dc.num_regions == 0) {
+    if (dpa_offset + 64 >= vmr_size + pmr_size && ct3d->dc.num_regions == 0) {
         return false;
     }
 
-    if (vmr) {
-        if (dpa_offset < int128_get64(vmr->size)) {
-            as = &ct3d->hostvmem_as;
-        } else {
-			if (pmr) {
-				if (dpa_offset < int128_get64(ct3d->cxl_dstate.static_mem_size)) {
-						as = &ct3d->hostpmem_as;
-						dpa_offset -= vmr->size;
-				} else {
-					as = &ct3d->dc.host_dc_as;
-					dpa_offset -= (vmr->size + pmr->size);
-				}
-			} else {
-				as = &ct3d->dc.host_dc_as;
-				dpa_offset -= vmr->size;
-			}
-        }
-    } else {
-		if (pmr) {
-			if (dpa_offset < int128_get64(pmr->size))
-				as = &ct3d->hostpmem_as;
-			else {
-				as = &ct3d->dc.host_dc_as;
-				dpa_offset -= pmr->size;
-			}
-		} else {
-			as = &ct3d->dc.host_dc_as;
-		}
-    }
+	if (dpa_offset < vmr_size) {
+		as = &ct3d->hostvmem_as;
+	} else if (dpa_offset < vmr_size + pmr_size) {
+		as = &ct3d->hostpmem_as;
+		dpa_offset -= vmr->size;
+	} else {
+		as = &ct3d->dc.host_dc_as;
+		dpa_offset -= (vmr_size + pmr_size);
+	}
 
     address_space_write(as, dpa_offset, MEMTXATTRS_UNSPECIFIED, &data, 64);
     return true;
