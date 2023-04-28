@@ -708,6 +708,7 @@ static int cxl_create_toy_regions(CXLType3Dev *ct3d)
 
 		region_base += region->len;
 	}
+	QTAILQ_INIT(&ct3d->dc.extents);
 
 	return 0;
 }
