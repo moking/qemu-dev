@@ -211,7 +211,7 @@ typedef struct cxl_device_state {
     } timestamp;
 
     /* memory region size, HDM */
-    uint64_t mem_size;
+	uint64_t static_mem_size;
     uint64_t pmem_size;
     uint64_t vmem_size;
 
@@ -412,6 +412,7 @@ typedef struct CXLDCD_Region {
 	uint64_t block_size;
 	uint32_t dsmadhandle;
 	uint8_t flags;
+	unsigned long *blk_bitmap;
 } CXLDCD_Region;
 
 struct CXLType3Dev {
@@ -447,12 +448,17 @@ struct CXLType3Dev {
     uint64_t poison_list_overflow_ts;
 
 	struct dynamic_capacity {
+		HostMemoryBackend *host_dc;
+		AddressSpace host_dc_as;
+
+		uint8_t num_hosts; //Table 7-55
 		uint8_t num_regions; // 1-8
 		struct CXLDCD_Region regions[DCD_MAX_REGION_NUM];
 		CXLDCDExtentList extents;
 
 		uint32_t total_extent_count;
 		uint32_t ext_list_gen_seq;
+		uint64_t total_dynamic_capicity; // 256M aligned
 	} dc;
 };
 
